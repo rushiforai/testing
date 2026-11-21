@@ -1,0 +1,78 @@
+name: 🧩 App patch request
+description: Request a new patch for an app. An AI agent will try to build it automatically.
+title: "patch: "
+labels: ["ai-patch"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Request a patch
+
+        Fill in every required field. An AI agent runs automatically when this issue is
+        created, builds the patch, and replies here with a test build.
+
+        > [!IMPORTANT]
+        > The link must be a **direct download** to one app file: `.apk`, `.apkm`, `.xapk` or
+        > `.apks`. The hard limit is 100 MB. Any `http(s)` host is accepted; links that need a
+        > click or sign-in usually fail, and the agent will reply with the error.
+
+  - type: input
+    id: app_name
+    attributes:
+      label: App name
+      description: The app's name as it appears on your launcher or Play Store.
+      placeholder: Example App
+    validations:
+      required: true
+
+  - type: input
+    id: package_name
+    attributes:
+      label: Package name
+      description: >-
+        The Android package name. Open the app's Play Store page and copy the value after
+        `?id=` in the URL, for example `com.example.app`.
+      placeholder: com.example.app
+    validations:
+      required: true
+
+  - type: input
+    id: apk_url
+    attributes:
+      label: Direct app file download URL
+      description: >-
+        Direct `http(s)` link to one `.apk`, `.apkm`, `.xapk` or `.apks` file. One URL only, hard
+        limit 100 MB. Any host is accepted. For tmpfiles.org, use the `/dl/` link (for example
+        `https://tmpfiles.org/dl/1234567/app.apk`), not the preview page.
+      placeholder: https://example.com/app.apk
+    validations:
+      required: true
+
+  - type: input
+    id: app_version
+    attributes:
+      label: App version (optional)
+      description: The version of the APK above, if you know it. The agent detects it from the file anyway.
+      placeholder: "1.2.3"
+
+  - type: textarea
+    id: request
+    attributes:
+      label: What should the patch do?
+      description: >-
+        Describe the behaviour to remove or change, for example "remove banner ads" or
+        "unlock premium". Add screenshots or details that help locate the feature.
+      placeholder: Remove the banner ads at the bottom of the main screen.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: acknowledgements
+    attributes:
+      label: Acknowledgements
+      description: Your request is skipped if these are not confirmed.
+      options:
+        - label: The link is a direct download to one APK/APKM/XAPK/APKS file, max 100 MB (hard limit).
+          required: true
+        - label: I understand an AI agent generates the patch and it may not work on the first attempt.
+          required: true

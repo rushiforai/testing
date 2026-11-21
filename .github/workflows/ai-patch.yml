@@ -1,0 +1,844 @@
+name: AI patch agent
+
+# Turns a "App patch request" issue into a Morphe patch, pushes it to `dev`, and replies on the
+# issue. Comment `worked` on the issue to close it, or comment more details to retry.
+#
+# The full agent brief is supplied only through the AGENT_BRIEF repository secret and is
+# written to a runner-temporary prompt for the run, never into the repository.
+# Reference patches are a sparse checkout of morphe-archive/examplepatches at $EXAMPLE_PATCHES_DIR.
+#
+# Secrets:
+#   AI_API_KEY         required; OpenAI-compatible API key
+#   AI_MODEL           required; model id
+#   AGENT_BRIEF        required; the only agent brief (AGENTS.md content). Keep it out of the repository.
+#   AI_BASE_URL        optional; defaults to https://tokenharbor.ai/v1
+#
+# This file must exist on the repository's default branch for `issues` / `issue_comment` events.
+# Runs are serialized: GitHub Actions keeps one run active and one pending, so a newer pending
+# run replaces an older pending one. The active issue is locked and unlocked by the first/last jobs.
+
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue number to process
+        required: true
+        type: number
+
+concurrency:
+  group: ai-patch
+  cancel-in-progress: false
+
+jobs:
+  lock:
+    name: Lock issue
+    if: vars.AI_PATCH_ENABLED != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    outputs:
+      locked: ${{ steps.lock.outputs.locked }}
+    env:
+      ISSUE_NUMBER: ${{ github.event.issue.number || github.event.inputs.issue_number }}
+    steps:
+      - name: Lock issue while CI runs
+        id: lock
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ISSUE_NUMBER:-}" ]; then
+            echo "::warning::No issue number; skipping issue lock"
+            exit 0
+          fi
+
+          ISSUE=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}")
+          if jq -e '.pull_request != null' <<< "$ISSUE" >/dev/null; then
+            echo "Not an issue; skipping lock"
+            exit 0
+          fi
+          if [ "$(jq -r '.state' <<< "$ISSUE")" != "open" ]; then
+            echo "Issue is not open; skipping lock"
+            exit 0
+          fi
+          if [ "$(jq -r '.locked' <<< "$ISSUE")" = "true" ]; then
+            echo "Issue is already locked; leaving it unchanged"
+            exit 0
+          fi
+          if ! jq -e '(.labels[]?.name == "ai-patch") or (.title | startswith("patch: ")) or ((.body // "") | contains("### Direct app file download URL"))' <<< "$ISSUE" >/dev/null; then
+            echo "Not a patch request; skipping lock"
+            exit 0
+          fi
+
+          if gh issue lock "$ISSUE_NUMBER" --reason "resolved"; then
+            echo "locked=true" >> "$GITHUB_OUTPUT"
+            gh issue comment "$ISSUE_NUMBER" \
+              --body "🔒 **CI is running for this issue.** Comments are locked until the run finishes so new comments don't interrupt it. The bot will unlock the issue automatically.
+
+          <!-- ai-patch-lock -->" \
+              || echo "::warning::Could not post the lock comment"
+          else
+            echo "::warning::Could not lock issue #${ISSUE_NUMBER}; continuing without a lock"
+          fi
+
+  agent:
+    name: Generate patch
+    needs: lock
+    if: vars.AI_PATCH_ENABLED != 'false'
+    outputs:
+      mode: ${{ steps.prepare.outputs.mode }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    permissions:
+      contents: read
+      issues: read
+      packages: read
+    env:
+      ISSUE_NUMBER: ${{ github.event.issue.number || github.event.inputs.issue_number }}
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v7
+        with:
+          ref: dev
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record base commit
+        run: git rev-parse HEAD > "${RUNNER_TEMP}/base-commit"
+
+      # Pin the helper before the agent can modify the working tree. The agent may only touch
+      # patch sources, but validation must never execute a script the agent could have edited.
+      - name: Pin helper script
+        run: cp .github/scripts/ai_patch.py "${RUNNER_TEMP}/ai_patch.py"
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "lts/*"
+
+      - name: Prepare issue and APK
+        id: prepare
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AGENT_BRIEF: ${{ secrets.AGENT_BRIEF }}
+        run: python3 "${RUNNER_TEMP}/ai_patch.py" prepare
+
+      - name: Clone reference example patches
+        if: steps.prepare.outputs.mode == 'run'
+        run: |
+          set -euo pipefail
+          export GIT_TERMINAL_PROMPT=0
+          REPO_DIR="${RUNNER_TEMP}/morphe-archive"
+          EXAMPLE_SUBDIR="examplepatches"
+          rm -rf "${REPO_DIR}"
+
+          # Bound the clone so a network hang cannot consume the whole run.
+          if timeout 180 git clone --depth 1 --filter=blob:none --sparse \
+              "https://github.com/rushiforai/morphe-archive.git" "${REPO_DIR}"; then
+            if timeout 120 git -C "${REPO_DIR}" sparse-checkout set "${EXAMPLE_SUBDIR}"; then
+              echo "EXAMPLE_PATCHES_DIR=${REPO_DIR}/${EXAMPLE_SUBDIR}" >> "$GITHUB_ENV"
+              echo "Example patches available at ${REPO_DIR}/${EXAMPLE_SUBDIR}"
+            fi
+          else
+            echo "::warning::Could not clone rushiforai/morphe-archive; continuing without example patches"
+          fi
+
+      - name: Install analysis packages (apt)
+        if: steps.prepare.outputs.mode == 'run'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            ca-certificates curl git jq unzip zip wget ripgrep \
+            cmake ninja-build build-essential pkg-config \
+            libicu-dev libcapstone-dev python3-venv >/dev/null
+
+      - name: Install decompilers and native tools
+        if: steps.prepare.outputs.mode == 'run'
+        timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          APKTOOL_VERSION=2.11.1
+          curl -fsSL -o "${RUNNER_TEMP}/apktool.jar" \
+            "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar"
+          sudo mkdir -p /opt/apktool
+          sudo mv "${RUNNER_TEMP}/apktool.jar" /opt/apktool/apktool.jar
+          printf '#!/bin/sh\nexec java -jar /opt/apktool/apktool.jar "$@"\n' | sudo tee /usr/local/bin/apktool >/dev/null
+          sudo chmod +x /usr/local/bin/apktool
+
+          JADX_VERSION=1.5.1
+          curl -fsSL -o "${RUNNER_TEMP}/jadx.zip" \
+            "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip"
+          sudo rm -rf /opt/jadx
+          sudo mkdir -p /opt/jadx
+          sudo unzip -q -o "${RUNNER_TEMP}/jadx.zip" -d /opt/jadx
+          sudo chmod +x /opt/jadx/bin/jadx
+          sudo ln -sf /opt/jadx/bin/jadx /usr/local/bin/jadx
+
+          DEX2JAR_VERSION=2.4
+          DEX2JAR_HOME="/opt/dex-tools-v${DEX2JAR_VERSION}"
+          sudo rm -rf "${DEX2JAR_HOME}"
+          curl -fsSL -o "${RUNNER_TEMP}/dex2jar.zip" \
+            "https://github.com/pxb1988/dex2jar/releases/download/v${DEX2JAR_VERSION}/dex-tools-v${DEX2JAR_VERSION}.zip"
+          sudo unzip -q -o "${RUNNER_TEMP}/dex2jar.zip" -d /opt
+          sudo chmod +x "${DEX2JAR_HOME}"/*.sh
+          sudo ln -sf "${DEX2JAR_HOME}/d2j-baksmali.sh" /usr/local/bin/baksmali
+          sudo ln -sf "${DEX2JAR_HOME}/d2j-smali.sh" /usr/local/bin/smali
+          sudo ln -sf "${DEX2JAR_HOME}/d2j-dex2jar.sh" /usr/local/bin/dex2jar
+          sudo ln -sf "${DEX2JAR_HOME}/d2j-jar2dex.sh" /usr/local/bin/jar2dex
+          echo "DEX2JAR_HOME=${DEX2JAR_HOME}" >> "$GITHUB_ENV"
+
+          # Ghidra is large and optional: a failed download must not block the patch run.
+          GHIDRA_VERSION=11.3.2
+          GHIDRA_DATE=20250415
+          GHIDRA_HOME="/opt/ghidra_${GHIDRA_VERSION}_PUBLIC"
+          if [ ! -x "${GHIDRA_HOME}/ghidraRun" ]; then
+            if curl -fsSL -o "${RUNNER_TEMP}/ghidra.zip" \
+                "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_DATE}.zip"; then
+              sudo unzip -q -o "${RUNNER_TEMP}/ghidra.zip" -d /opt
+              rm -f "${RUNNER_TEMP}/ghidra.zip"
+            else
+              echo "::warning::Ghidra download failed; continuing without it"
+            fi
+          fi
+          if [ -x "${GHIDRA_HOME}/ghidraRun" ]; then
+            sudo ln -sf "${GHIDRA_HOME}/ghidraRun" /usr/local/bin/ghidra
+            sudo ln -sf "${GHIDRA_HOME}/support/analyzeHeadless" /usr/local/bin/ghidra-headless
+            echo "GHIDRA_HOME=${GHIDRA_HOME}" >> "$GITHUB_ENV"
+          fi
+
+          # Blutter is cloned only; it builds on first use when a Flutter app needs it.
+          BLUTTER_HOME="${RUNNER_TEMP}/blutter"
+          if [ ! -d "${BLUTTER_HOME}/.git" ]; then
+            if timeout 120 git clone --depth 1 https://github.com/worawit/blutter.git "${BLUTTER_HOME}"; then
+              :
+            else
+              echo "::warning::blutter clone failed; continuing without it"
+              rm -rf "${BLUTTER_HOME}"
+            fi
+          fi
+          if [ -d "${BLUTTER_HOME}" ]; then
+            echo "BLUTTER_HOME=${BLUTTER_HOME}" >> "$GITHUB_ENV"
+          fi
+
+          # Morphe CLI is best effort: without it runtime verification is skipped. If it is present
+          # but cannot apply the built patch, verification fails and publishing is blocked.
+          ASSET=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/MorpheApp/morphe-desktop/releases/latest" \
+            | jq -r '[.assets[] | select(.name | test("-all\\.jar$")) | .browser_download_url][0] // empty' || true)
+          if [ -n "${ASSET}" ]; then
+            curl -fsSL -o "${RUNNER_TEMP}/morphe-cli.jar" "${ASSET}" || rm -f "${RUNNER_TEMP}/morphe-cli.jar"
+          fi
+          if [ ! -s "${RUNNER_TEMP}/morphe-cli.jar" ]; then
+            echo "::warning::Morphe CLI could not be downloaded; runtime verification will be skipped"
+          fi
+
+      - name: Install Python analysis tools
+        if: steps.prepare.outputs.mode == 'run'
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          VENV="${RUNNER_TEMP}/venv"
+          python3 -m venv "${VENV}"
+          "${VENV}/bin/pip" install --upgrade pip >/dev/null
+          "${VENV}/bin/pip" install --no-cache-dir \
+            androguard apkid capstone pyelftools requests
+          "${VENV}/bin/pip" install --no-cache-dir \
+            hermes-dec apksigcopier apkutils2 apksigtool droidlysis apknife hbctool \
+            || echo "::warning::Some optional Python analysis tools failed to install"
+          echo "${VENV}/bin" >> "$GITHUB_PATH"
+
+      - name: Install Codex CLI
+        if: steps.prepare.outputs.mode == 'run'
+        run: |
+          set -euo pipefail
+          npm install --global @openai/codex
+          codex --version
+
+      - name: Configure AI agent
+        if: steps.prepare.outputs.mode == 'run'
+        env:
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_MODEL: ${{ secrets.AI_MODEL }}
+          AI_BASE_URL: ${{ secrets.AI_BASE_URL || 'https://tokenharbor.ai/v1' }}
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+        run: |
+          set -euo pipefail
+
+          : "${AI_API_KEY:?Set the AI_API_KEY repository secret}"
+          : "${AI_MODEL:?Set the AI_MODEL repository secret}"
+
+          case "${AI_BASE_URL}" in
+            http://*|https://*) ;;
+            *) AI_BASE_URL="https://${AI_BASE_URL}" ;;
+          esac
+
+          mkdir -p "${CODEX_HOME}"
+          cat > "${CODEX_HOME}/config.toml" <<EOF
+          model = "${AI_MODEL}"
+          model_provider = "patch-gateway"
+          approval_policy = "never"
+          sandbox_mode = "danger-full-access"
+
+          [model_providers.patch-gateway]
+          name = "Patch gateway"
+          base_url = "${AI_BASE_URL}"
+          wire_api = "responses"
+          env_key = "AI_GATEWAY_API_KEY"
+
+          [shell_environment_policy.filters]
+          AI_GATEWAY_API_KEY = "exclude"
+          EOF
+
+          # CI autonomy override. The brief is already in task.md; no separate AGENTS.md is created.
+          # Keep this last so it wins if an earlier instruction mentions asking for confirmation.
+          cat >> "${RUNNER_TEMP}/task.md" <<'EOF'
+
+          ## CI autonomy override
+
+          There is no human available during this run. Never ask a question, request confirmation, or
+          wait for a user reply. Do not end with "Should I proceed?" or a plan. If a build or Morphe CLI
+          apply fails, diagnose it, fix the patch, rebuild, and retry until it applies or you have a
+          concrete blocker. Ignore any earlier instruction that asks for confirmation.
+          EOF
+
+      - name: Run AI agent
+        id: agent
+        if: steps.prepare.outputs.mode == 'run'
+        # A failed or question-only run must not stop the job: the repair step below gets a
+        # chance to fix the working tree, rebuild and re-apply.
+        continue-on-error: true
+        timeout-minutes: 80
+        env:
+          AI_GATEWAY_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_MODEL: ${{ secrets.AI_MODEL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+          MORPHE_CLI: ${{ runner.temp }}/morphe-cli.jar
+          APK_PATH: ${{ steps.prepare.outputs.apk_path }}
+          BASE_APK_PATH: ${{ steps.prepare.outputs.base_apk_path }}
+        run: |
+          set -uo pipefail
+
+          # Codex echoes its prompt, which contains the private run brief. Never pipe the
+          # transcript into the Actions log; keep it in runner temp and print only a sanitized
+          # tail of known status lines.
+          LOG="${RUNNER_TEMP}/agent-output.log"
+          TASK_SNAPSHOT="${RUNNER_TEMP}/task-private-scan.md"
+          : > "$LOG"
+          cp "${RUNNER_TEMP}/task.md" "$TASK_SNAPSHOT" 2>/dev/null || true
+
+          status=0
+          codex exec \
+            --sandbox danger-full-access \
+            --skip-git-repo-check \
+            --model "${AI_MODEL}" \
+            --output-last-message "${RUNNER_TEMP}/agent-message.md" \
+            - < "${RUNNER_TEMP}/task.md" > "$LOG" 2>&1 || status=$?
+
+          echo "Codex exited with status ${status}. Full output is in the runner temp directory."
+          python3 - "$LOG" "$TASK_SNAPSHOT" <<'PY' || true
+          import os
+          import re
+          import sys
+          from collections import deque
+          from pathlib import Path
+
+          log_path, task_path = sys.argv[1:3]
+          ansi = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+          safe_line = re.compile(
+              r"^(?:-{3,}|"
+              r"(?:model|provider|approval|sandbox|workdir|reasoning effort|session|tokens used)\b|"
+              r"(?:error|warning|fatal|failure)\b|"
+              r"(?:codex exited|process exited|exit code)\b)",
+              re.IGNORECASE,
+          )
+          secret_keys = (
+              "AI_GATEWAY_API_KEY",
+              "GITHUB_TOKEN",
+          )
+          secrets = [
+              os.environ[key]
+              for key in secret_keys
+              if len(os.environ.get(key, "")) >= 8
+          ]
+
+          private = ""
+          task = Path(task_path)
+          if task.is_file():
+              text = task.read_text(encoding="utf-8", errors="replace")
+              brief_start = "<!-- agent-brief:start -->"
+              brief_end = "<!-- agent-brief:end -->"
+              if brief_start in text and brief_end in text:
+                  private += "\n" + text.split(brief_start, 1)[1].split(brief_end, 1)[0]
+
+          private_lines = {
+              re.sub(r"\s+", " ", line).strip().lower()
+              for line in private.splitlines()
+              if len(line.strip()) >= 12
+          }
+          private_ngrams = set()
+          for line in private_lines:
+              words = re.findall(r"[a-z0-9]+", line)
+              for index in range(len(words) - 2):
+                  private_ngrams.add(" ".join(words[index:index + 3]))
+          private_tokens = {
+              token.lower()
+              for token in re.findall(r"[A-Za-z0-9_\-]{6,}", private)
+          }
+          private_tokens.update(
+              token.lower()
+              for token in re.findall(r"\b[A-Z][A-Z0-9_\-]{2,}\b", private)
+          )
+
+          def sanitize(value: str) -> str:
+              value = ansi.sub("", value).replace("\r", "")
+              for secret in secrets:
+                  value = value.replace(secret, "[REDACTED]")
+              value = re.sub(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b", "[REDACTED]", value)
+              value = re.sub(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", "[REDACTED]", value)
+              value = re.sub(r"\bsk-[A-Za-z0-9]{20,}\b", "[REDACTED]", value)
+              value = re.sub(
+                  r"(?i)\b(api[_-]?key|token|secret|password)\s*[:=]\s*\S+",
+                  r"\1=[REDACTED]",
+                  value,
+              )
+              return value[:300]
+
+          lines = deque(maxlen=200)
+          try:
+              with open(log_path, encoding="utf-8", errors="replace") as handle:
+                  for raw in handle:
+                      lines.append(raw.rstrip("\n"))
+          except FileNotFoundError:
+              pass
+
+          tail = []
+          for raw in lines:
+              line = sanitize(raw).strip()
+              if not line or not safe_line.match(line):
+                  continue
+              normalized = re.sub(r"\s+", " ", line).lower()
+              if any(item in normalized for item in private_lines):
+                  continue
+              if any(ngram in normalized for ngram in private_ngrams):
+                  continue
+              if private_tokens & set(re.findall(r"[a-z0-9_\-]{6,}", normalized)):
+                  continue
+              tail.append(line)
+
+          if tail:
+              print("--- sanitized agent output tail ---")
+              for line in tail[-15:]:
+                  print(line)
+          else:
+              print("--- no safe agent output lines to display ---")
+          PY
+
+          exit "$status"
+
+      - name: Validate generated changes
+        id: validate_changes
+        if: steps.prepare.outputs.mode == 'run' && steps.agent.outcome == 'success'
+        # Keep going so the repair step can fix validation/build/apply failures.
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          python3 "${RUNNER_TEMP}/ai_patch.py" validate 2>&1 | tee "${RUNNER_TEMP}/validate.log"
+
+      - name: Build patch bundle
+        id: build_bundle
+        if: steps.prepare.outputs.mode == 'run' && steps.validate_changes.outcome == 'success'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          ./gradlew :patches:buildAndroid --no-daemon 2>&1 | tee "${RUNNER_TEMP}/build.log"
+
+      - name: Verify patch against the APK
+        id: verify_patch
+        if: steps.prepare.outputs.mode == 'run' && steps.build_bundle.outcome == 'success'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APK_PATH: ${{ steps.prepare.outputs.apk_path }}
+          MORPHE_CLI: ${{ runner.temp }}/morphe-cli.jar
+        run: |
+          set -euo pipefail
+          python3 "${RUNNER_TEMP}/ai_patch.py" verify
+          STATUS=$(cut -d'|' -f1 "${RUNNER_TEMP}/verify-status" 2>/dev/null || true)
+          case "$STATUS" in
+            verified|skipped) ;;
+            *)
+              echo "::error::Morphe CLI verification did not succeed (status: ${STATUS:-missing})"
+              exit 1
+              ;;
+          esac
+          echo "Verification status: ${STATUS}"
+
+      - name: Repair patch after failed verification
+        if: |
+          steps.prepare.outputs.mode == 'run' &&
+          (steps.agent.outcome == 'failure' ||
+           steps.validate_changes.outcome == 'failure' ||
+           steps.build_bundle.outcome == 'failure' ||
+           steps.verify_patch.outcome == 'failure')
+        timeout-minutes: 60
+        env:
+          AI_GATEWAY_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_MODEL: ${{ secrets.AI_MODEL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+          MORPHE_CLI: ${{ runner.temp }}/morphe-cli.jar
+          APK_PATH: ${{ steps.prepare.outputs.apk_path }}
+          BASE_APK_PATH: ${{ steps.prepare.outputs.base_apk_path }}
+          INITIAL_AGENT_OUTCOME: ${{ steps.agent.outcome }}
+          INITIAL_VALIDATE_OUTCOME: ${{ steps.validate_changes.outcome }}
+          INITIAL_BUILD_OUTCOME: ${{ steps.build_bundle.outcome }}
+          INITIAL_VERIFY_OUTCOME: ${{ steps.verify_patch.outcome }}
+        run: |
+          set -uo pipefail
+
+          # No user can answer questions mid-run. Feed the failure back to the agent and make it
+          # repair the existing working tree, rebuild, and re-apply. Codex output stays in
+          # runner temp because its prompt contains the private run brief.
+          INITIAL_STAGE="the initial attempt"
+          INITIAL_LOG=""
+          if [ "${INITIAL_AGENT_OUTCOME}" = "failure" ]; then
+            INITIAL_STAGE="the initial agent run"
+          elif [ "${INITIAL_VALIDATE_OUTCOME}" = "failure" ]; then
+            INITIAL_STAGE="validation"
+            INITIAL_LOG="${RUNNER_TEMP}/validate.log"
+          elif [ "${INITIAL_BUILD_OUTCOME}" = "failure" ]; then
+            INITIAL_STAGE="the Gradle build"
+            INITIAL_LOG="${RUNNER_TEMP}/build.log"
+          elif [ "${INITIAL_VERIFY_OUTCOME}" = "failure" ]; then
+            INITIAL_STAGE="Morphe CLI apply"
+            INITIAL_LOG="${RUNNER_TEMP}/verify.log"
+          fi
+
+          for attempt in 1 2; do
+            echo "Automatic repair attempt ${attempt} after ${INITIAL_STAGE} failed."
+            cp "${RUNNER_TEMP}/task.md" "${RUNNER_TEMP}/repair-task.md"
+            {
+              echo ""
+              echo "## Automatic repair attempt ${attempt}"
+              echo ""
+              echo "Nobody can answer questions during this run. Do not ask for confirmation,"
+              echo "do not ask \"should I proceed?\", and do not wait for a user reply."
+              echo "The previous attempt failed at ${INITIAL_STAGE}. Fix the existing changes"
+              echo "in the working tree, rebuild, and re-apply the patch with Morphe CLI. Retry"
+              echo "on your own until it applies cleanly or you have a concrete blocker."
+              echo ""
+              if [ -n "${INITIAL_LOG}" ] && [ -f "${INITIAL_LOG}" ]; then
+                echo "### Failure output"
+                echo ""
+                tail -c 12000 "${INITIAL_LOG}" || true
+                echo ""
+              fi
+            } >> "${RUNNER_TEMP}/repair-task.md"
+
+            CODEX_LOG="${RUNNER_TEMP}/repair-${attempt}-codex.log"
+            codex_status=0
+            codex exec \
+              --sandbox danger-full-access \
+              --skip-git-repo-check \
+              --model "${AI_MODEL}" \
+              --output-last-message "${RUNNER_TEMP}/repair-message-${attempt}.md" \
+              - < "${RUNNER_TEMP}/repair-task.md" > "$CODEX_LOG" 2>&1 || codex_status=$?
+            echo "Repair Codex attempt ${attempt} exited with status ${codex_status}."
+
+            VALIDATE_LOG="${RUNNER_TEMP}/repair-${attempt}-validate.log"
+            BUILD_LOG="${RUNNER_TEMP}/repair-${attempt}-build.log"
+            VERIFY_STEP_LOG="${RUNNER_TEMP}/repair-${attempt}-verify.log"
+            INITIAL_STAGE=""
+            INITIAL_LOG=""
+
+            if ! python3 "${RUNNER_TEMP}/ai_patch.py" validate > "$VALIDATE_LOG" 2>&1; then
+              INITIAL_STAGE="validation"
+              INITIAL_LOG="$VALIDATE_LOG"
+            elif ! ./gradlew :patches:buildAndroid --no-daemon > "$BUILD_LOG" 2>&1; then
+              INITIAL_STAGE="the Gradle build"
+              INITIAL_LOG="$BUILD_LOG"
+            elif ! python3 "${RUNNER_TEMP}/ai_patch.py" verify > "$VERIFY_STEP_LOG" 2>&1; then
+              INITIAL_STAGE="Morphe CLI apply"
+              INITIAL_LOG="${RUNNER_TEMP}/verify.log"
+            else
+              echo "Repair attempt ${attempt} built and applied successfully."
+              exit 0
+            fi
+
+            echo "::warning::Repair attempt ${attempt} failed at ${INITIAL_STAGE}."
+            if [ -n "${INITIAL_LOG}" ] && [ -f "${INITIAL_LOG}" ]; then
+              tail -n 20 "${INITIAL_LOG}" || true
+            fi
+          done
+
+          echo "::error::Automatic repair attempts did not produce a patch that applies."
+          exit 1
+
+      - name: Package result
+        if: always() && steps.prepare.outputs.mode == 'run'
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ai-patch-result"
+
+          git add -N -- patches/src extensions/extension/src 2>/dev/null || true
+          git diff --binary -- patches/src extensions/extension/src > "${RUNNER_TEMP}/ai-patch-result/agent.patch" || true
+
+          for file in issue.json verify-status prepare-error.txt; do
+            if [ -f "${RUNNER_TEMP}/${file}" ]; then
+              cp "${RUNNER_TEMP}/${file}" "${RUNNER_TEMP}/ai-patch-result/${file}"
+            fi
+          done
+          if [ -f "${RUNNER_TEMP}/verify.log" ]; then
+            tail -c 100000 "${RUNNER_TEMP}/verify.log" > "${RUNNER_TEMP}/ai-patch-result/verify.log" || true
+          fi
+
+      - name: Upload result
+        if: always() && steps.prepare.outputs.mode == 'run'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-patch-result
+          path: ${{ runner.temp }}/ai-patch-result
+          retention-days: 7
+          if-no-files-found: ignore
+
+  publish:
+    name: Publish patch
+    needs: agent
+    if: success() && needs.agent.outputs.mode == 'run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+      issues: write
+      actions: write
+      packages: read
+    env:
+      ISSUE_NUMBER: ${{ github.event.issue.number || github.event.inputs.issue_number }}
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v7
+        with:
+          ref: dev
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Trusted copy: the artifact is applied after this, so it cannot replace the validator.
+      - name: Pin helper script
+        run: cp .github/scripts/ai_patch.py "${RUNNER_TEMP}/ai_patch.py"
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Download result
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-patch-result
+          path: ${{ runner.temp }}/ai-patch-result
+
+      - name: Apply generated patch
+        run: |
+          set -euo pipefail
+          PATCH_FILE="${RUNNER_TEMP}/ai-patch-result/agent.patch"
+          if [ ! -s "${PATCH_FILE}" ]; then
+            echo "::error::The agent produced no changes to publish"
+            exit 1
+          fi
+          git apply --binary --whitespace=nowarn "${PATCH_FILE}"
+
+          for file in issue.json verify-status verify.log; do
+            if [ -f "${RUNNER_TEMP}/ai-patch-result/${file}" ]; then
+              cp "${RUNNER_TEMP}/ai-patch-result/${file}" "${RUNNER_TEMP}/${file}"
+            fi
+          done
+
+      # Defence in depth: even if the agent job were to report success with a failed verification
+      # status, never push a dev build whose patch was not verified or explicitly skipped.
+      - name: Require successful verification
+        run: |
+          set -euo pipefail
+          STATUS_FILE="${RUNNER_TEMP}/verify-status"
+          if [ ! -f "$STATUS_FILE" ]; then
+            echo "::error::No verification result was recorded; refusing to publish"
+            exit 1
+          fi
+          STATUS=$(cut -d'|' -f1 "$STATUS_FILE")
+          case "$STATUS" in
+            verified|skipped) ;;
+            *)
+              echo "::error::Verification status '${STATUS}' does not allow publishing"
+              exit 1
+              ;;
+          esac
+          echo "Verification status: ${STATUS}"
+
+      - name: Validate generated changes
+        run: python3 "${RUNNER_TEMP}/ai_patch.py" validate
+
+      - name: Build patch bundle
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./gradlew :patches:buildAndroid --no-daemon
+
+      - name: Commit and push to dev
+        env:
+          PUSH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          APP_NAME="app"
+          if [ -f "${RUNNER_TEMP}/issue.json" ]; then
+            APP_NAME=$(jq -r '.app_name // "app"' "${RUNNER_TEMP}/issue.json")
+          fi
+          APP_SAFE=$(printf '%s' "${APP_NAME}" | tr -d '\r\n' | cut -c1-60)
+
+          git add -A -- patches/src extensions/extension/src
+          if git diff --cached --quiet; then
+            echo "::error::Nothing to commit"
+            exit 1
+          fi
+          git commit \
+            -m "feat(patches): add ${APP_SAFE} patch (#${ISSUE_NUMBER})" \
+            -m "Automated patch generated from issue #${ISSUE_NUMBER}."
+
+          git fetch origin dev
+          git rebase origin/dev
+
+          AUTH=$(printf 'x-access-token:%s' "${PUSH_TOKEN}" | base64 -w0)
+          git -c http.extraheader="AUTHORIZATION: basic ${AUTH}" push origin HEAD:dev
+
+          # A push made with GITHUB_TOKEN does not trigger other workflows, so start the
+          # release and dev->main PR workflows explicitly.
+          gh workflow run release.yml --ref dev \
+            || echo "::warning::Could not dispatch release.yml; run it manually"
+          gh workflow run open_pull_request.yml --ref dev \
+            || echo "::warning::Could not dispatch open_pull_request.yml"
+
+      - name: Comment on issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 "${RUNNER_TEMP}/ai_patch.py" comment-success
+
+  close-worked:
+    name: Close confirmed issue
+    needs: agent
+    if: success() && needs.agent.outputs.mode == 'close'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    env:
+      ISSUE_NUMBER: ${{ github.event.issue.number || github.event.inputs.issue_number }}
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v7
+        with:
+          ref: dev
+          persist-credentials: false
+
+      - name: Close issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp .github/scripts/ai_patch.py "${RUNNER_TEMP}/ai_patch.py"
+          python3 "${RUNNER_TEMP}/ai_patch.py" close
+
+  notify-failure:
+    name: Report failure
+    needs: [agent, publish]
+    if: failure() && needs.agent.outputs.mode != 'skip' && needs.agent.outputs.mode != 'close'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    env:
+      ISSUE_NUMBER: ${{ github.event.issue.number || github.event.inputs.issue_number }}
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v7
+        with:
+          ref: dev
+          persist-credentials: false
+
+      - name: Pin helper script
+        run: cp .github/scripts/ai_patch.py "${RUNNER_TEMP}/ai_patch.py"
+
+      - name: Download result
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: ai-patch-result
+          path: ${{ runner.temp }}/ai-patch-result
+
+      - name: Restore diagnostics
+        run: |
+          for file in issue.json verify-status verify.log prepare-error.txt; do
+            if [ -f "${RUNNER_TEMP}/ai-patch-result/${file}" ]; then
+              cp "${RUNNER_TEMP}/ai-patch-result/${file}" "${RUNNER_TEMP}/${file}"
+            fi
+          done
+
+      - name: Comment failure
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 "${RUNNER_TEMP}/ai_patch.py" comment-failure
+
+  unlock:
+    name: Unlock issue
+    needs:
+      - lock
+      - agent
+      - publish
+      - close-worked
+      - notify-failure
+    if: always() && needs.lock.outputs.locked == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      ISSUE_NUMBER: ${{ github.event.issue.number || github.event.inputs.issue_number }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Unlock issue
+        run: |
+          set -euo pipefail
+          if [ -z "${ISSUE_NUMBER:-}" ]; then
+            echo "::warning::No issue number; cannot unlock"
+            exit 0
+          fi
+          if gh issue unlock "$ISSUE_NUMBER"; then
+            echo "Unlocked issue #${ISSUE_NUMBER}"
+          else
+            echo "::warning::Could not unlock issue #${ISSUE_NUMBER}"
+          fi
