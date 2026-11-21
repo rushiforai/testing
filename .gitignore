@@ -132,3 +132,9 @@ node_modules/
 # Ignore IDEA files
 .idea/
 local.properties
+
+# Private agent brief supplied via the AGENT_BRIEF secret. Never commit or push it.
+.github/agent/AGENTS.md
+
+# Private release signing key. The public key is committed; this file is not.
+morphe-signing.key
