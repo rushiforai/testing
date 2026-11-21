@@ -12,9 +12,8 @@ body:
         created, builds the patch, and replies here with a test build.
 
         > [!IMPORTANT]
-        > The link must be a **direct download** to one app file: `.apk`, `.apkm`, `.xapk` or
-        > `.apks`. The hard limit is 100 MB. Any `http(s)` host is accepted; links that need a
-        > click or sign-in usually fail, and the agent will reply with the error.
+        > Provide an `http(s)` link to one app file: `.apk`, `.apkm`, `.xapk` or `.apks`.
+        > The agent resolves supported landing pages; links that require a sign-in may fail.
 
   - type: input
     id: app_name
@@ -39,11 +38,10 @@ body:
   - type: input
     id: apk_url
     attributes:
-      label: Direct app file download URL
+      label: App file download URL
       description: >-
-        Direct `http(s)` link to one `.apk`, `.apkm`, `.xapk` or `.apks` file. One URL only, hard
-        limit 100 MB. Any host is accepted. For tmpfiles.org, use the `/dl/` link (for example
-        `https://tmpfiles.org/dl/1234567/app.apk`), not the preview page.
+        `http(s)` link to one `.apk`, `.apkm`, `.xapk` or `.apks` file. One URL only. Any host is
+        accepted. For tmpfiles.org, either the preview page or its direct `/dl/` link works.
       placeholder: https://example.com/app.apk
     validations:
       required: true
@@ -72,7 +70,7 @@ body:
       label: Acknowledgements
       description: Your request is skipped if these are not confirmed.
       options:
-        - label: The link is a direct download to one APK/APKM/XAPK/APKS file, max 100 MB (hard limit).
+        - label: The link points to one APK/APKM/XAPK/APKS file.
           required: true
         - label: I understand an AI agent generates the patch and it may not work on the first attempt.
           required: true

@@ -72,7 +72,7 @@ jobs:
             echo "Issue is already locked; leaving it unchanged"
             exit 0
           fi
-          if ! jq -e '(.labels[]?.name == "ai-patch") or (.title | startswith("patch: ")) or ((.body // "") | contains("### Direct app file download URL"))' <<< "$ISSUE" >/dev/null; then
+          if ! jq -e '(.labels[]?.name == "ai-patch") or (.title | startswith("patch: ")) or ((.body // "") | (contains("### App file download URL") or contains("### Direct app file download URL")))' <<< "$ISSUE" >/dev/null; then
             echo "Not a patch request; skipping lock"
             exit 0
           fi
@@ -129,6 +129,8 @@ jobs:
         with:
           node-version: "lts/*"
 
+      # Preparation only parses the issue and provides the URL/paths. The agent downloads,
+      # resolves landing pages, validates the size/type, and extracts the base APK.
       - name: Prepare issue and APK
         id: prepare
         env:
@@ -164,7 +166,8 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             ca-certificates curl git jq unzip zip wget ripgrep \
             cmake ninja-build build-essential pkg-config \
-            libicu-dev libcapstone-dev python3-venv >/dev/null
+            libicu-dev libcapstone-dev libxml2-dev libxslt1-dev \
+            python3-dev python3-venv >/dev/null
 
       - name: Install decompilers and native tools
         if: steps.prepare.outputs.mode == 'run'
@@ -331,6 +334,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CODEX_HOME: ${{ runner.temp }}/codex-home
           MORPHE_CLI: ${{ runner.temp }}/morphe-cli.jar
+          APK_URL: ${{ steps.prepare.outputs.apk_url }}
           APK_PATH: ${{ steps.prepare.outputs.apk_path }}
           BASE_APK_PATH: ${{ steps.prepare.outputs.base_apk_path }}
         run: |
@@ -507,6 +511,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CODEX_HOME: ${{ runner.temp }}/codex-home
           MORPHE_CLI: ${{ runner.temp }}/morphe-cli.jar
+          APK_URL: ${{ steps.prepare.outputs.apk_url }}
           APK_PATH: ${{ steps.prepare.outputs.apk_path }}
           BASE_APK_PATH: ${{ steps.prepare.outputs.base_apk_path }}
           INITIAL_AGENT_OUTCOME: ${{ steps.agent.outcome }}
@@ -546,6 +551,9 @@ jobs:
               echo "The previous attempt failed at ${INITIAL_STAGE}. Fix the existing changes"
               echo "in the working tree, rebuild, and re-apply the patch with Morphe CLI. Retry"
               echo "on your own until it applies cleanly or you have a concrete blocker."
+              echo "If the APK is missing at ${APK_PATH:-${RUNNER_TEMP}/input/app.apk}, download it"
+              echo "from ${APK_URL:-the issue URL} and extract the base APK to"
+              echo "${BASE_APK_PATH:-${RUNNER_TEMP}/input/base.apk} before rebuilding."
               echo ""
               if [ -n "${INITIAL_LOG}" ] && [ -f "${INITIAL_LOG}" ]; then
                 echo "### Failure output"

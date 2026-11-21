@@ -2,7 +2,7 @@
 """Helpers for the AI patch workflow.
 
 Subcommands:
-  prepare          Parse the triggering issue, download/validate the APK and write the task file.
+  prepare          Parse the triggering issue, provide the APK URL and paths, and write the task file.
   validate         Reject changes outside the allowed patch source tree.
   verify           Optionally apply the built patch bundle to the APK with Morphe CLI.
   comment-success  Post the result comment and labels on the issue.
@@ -26,8 +26,6 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-MAX_APK_MB = 100
-MAX_APK_BYTES = MAX_APK_MB * 1024 * 1024
 APP_FILE_TYPES = {".apk": "APK", ".apkm": "APKM", ".xapk": "XAPK", ".apks": "APKS"}
 PACKAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$")
 WORKED_RE = re.compile(r"^/?(worked|fixed|solved)[.!]*$")
@@ -363,17 +361,6 @@ def download_app_file(url: str, stem: Path) -> tuple[int, str, Path, Path, Path 
     )
     try:
         with urllib.request.urlopen(request, timeout=120) as response:
-            declared = response.headers.get("Content-Length")
-            try:
-                declared_bytes = int(declared) if declared else 0
-            except ValueError:
-                declared_bytes = 0
-            if declared_bytes > MAX_APK_BYTES:
-                fail_prepare(
-                    f"App file is too large: {declared_bytes / (1024 * 1024):.1f} MB "
-                    f"({declared_bytes} bytes; hard limit {MAX_APK_MB} MB)"
-                )
-
             total = 0
             with download_path.open("wb") as handle:
                 while True:
@@ -381,8 +368,6 @@ def download_app_file(url: str, stem: Path) -> tuple[int, str, Path, Path, Path 
                     if not chunk:
                         break
                     total += len(chunk)
-                    if total > MAX_APK_BYTES:
-                        fail_prepare(f"App file is larger than the hard limit of {MAX_APK_MB} MB")
                     handle.write(chunk)
     except urllib.error.HTTPError as error:
         fail_prepare(f"App file download failed with HTTP {error.code} for {url}")
@@ -549,35 +534,22 @@ def cmd_prepare() -> None:
     if parsed_url is None or not parsed_url.netloc:
         fail_prepare("The app file URL is not a valid http(s) URL.")
 
-    # tmpfiles.org serves the file itself from the /dl/ path.
-    if "tmpfiles.org/" in apk_url and "/dl/" not in apk_url:
-        apk_url = apk_url.replace("tmpfiles.org/", "tmpfiles.org/dl/", 1)
-
     write_output("app_name", app_name)
     write_output("package_name", requested_package)
+    write_output("apk_url", apk_url)
 
-    size, file_type, apk_path, base_apk_path, bundle_dir = download_app_file(
-        apk_url, TMP / "apk" / "app"
-    )
-    digest = hashlib.sha256(apk_path.read_bytes()).hexdigest()
+    # Preparation deliberately does not download the APK. The agent resolves the link,
+    # downloads it, enforces the size/type limits, and extracts the base APK.
+    input_dir = TMP / "input"
+    shutil.rmtree(input_dir, ignore_errors=True)
+    input_dir.mkdir(parents=True, exist_ok=True)
+    apk_path = input_dir / "app.apk"
+    base_apk_path = input_dir / "base.apk"
 
-    detected_package, detected_version = apk_metadata(base_apk_path)
-    if detected_package and detected_package != requested_package:
-        fail_prepare(
-            "The downloaded app file belongs to a different app.\n\n"
-            f"- Issue package: `{requested_package}`\n"
-            f"- Base APK package: `{detected_package}`\n\n"
-            "Check that the URL points to the right APK/APKM/XAPK/APKS."
-        )
-
-    if requested_version and detected_version and requested_version != detected_version:
-        log(f"::warning::Issue says version {requested_version}, APK is {detected_version}")
-
-    effective_package = detected_package or requested_package
-    write_output("apk_version", detected_version or requested_version)
+    write_output("apk_version", requested_version)
     write_output("apk_path", apk_path)
     write_output("base_apk_path", base_apk_path)
-    write_output("file_type", file_type)
+    write_output("file_type", "UNKNOWN")
 
     meta = {
         "issue_number": number,
@@ -585,17 +557,17 @@ def cmd_prepare() -> None:
         "title": issue.get("title", ""),
         "author": (issue.get("user") or {}).get("login", ""),
         "app_name": app_name,
-        "package_name": effective_package,
+        "package_name": requested_package,
         "requested_package_name": requested_package,
-        "apk_version": detected_version or requested_version,
+        "apk_version": requested_version,
         "requested_version": requested_version,
         "apk_url": apk_url,
         "apk_path": str(apk_path),
         "base_apk_path": str(base_apk_path),
-        "bundle_dir": str(bundle_dir) if bundle_dir else "",
-        "file_type": file_type,
-        "apk_sha256": digest,
-        "apk_size": size,
+        "bundle_dir": "",
+        "file_type": "UNKNOWN",
+        "apk_sha256": "",
+        "apk_size": 0,
         "request": request_text,
         "feedback": feedback,
     }
@@ -632,17 +604,27 @@ def cmd_prepare() -> None:
 
 {comments_text}
 
-## App file on this runner
+## APK download (your responsibility)
 
-- Uploaded file: `{apk_path}` ({file_type})
-- Base APK to decode for analysis: `{base_apk_path}`
-- Extracted bundle modules: `{bundle_dir if bundle_dir else '(not a bundle)'}`
+- URL: `{apk_url}`
+- Download destination: `{apk_path}`
+- Base APK destination: `{base_apk_path}`
+
+The workflow does not download the app file. Download and validate it yourself.
+The URL may be a file-host landing page; resolve the actual file link (for
+tmpfiles.org, follow the page's signed "Download" link). Require a valid ZIP/APK.
+Detect APK/APKM/XAPK/APKS. For a bundle, keep the original at `{apk_path}` and
+extract the base APK to `{base_apk_path}`.
+
+Verify that the base APK package is `{requested_package}`. If it is different,
+stop with a clear mismatch. Before finishing, update `{TMP / 'issue.json'}` with
+the detected `package_name`, `apk_version`, and `file_type`.
+
 - Package declared in the issue: `{requested_package}`
-- Package detected in the base APK: `{detected_package or 'unknown'}`
-- Version detected in the base APK: `{detected_version or requested_version or 'unknown'}`
-- Use `apkFileType = ApkFileType.{file_type}` in the `Compatibility` declaration.
-- SHA-256: `{digest}`
-- Size: {size} bytes
+- Requested version: `{requested_version or 'unknown'}`
+- Use `apkFileType = ApkFileType.<detected>` in the `Compatibility` declaration.
+- `{apk_path}` must exist and be the exact file Morphe CLI will patch.
+- `{base_apk_path}` must be a valid APK used for analysis.
 
 ## Reference patches
 
@@ -673,6 +655,7 @@ request needs a different approach.
 - Do not read or copy private agent instructions into the repository.
 - Do not copy the reference example patches into the repository; only adapt patterns you need.
 - There is no human in the loop: never ask a question, request confirmation, or wait for a reply.
+- Download the app file yourself from `$APK_URL` to `$APK_PATH` and extract `$BASE_APK_PATH`; the workflow does not download it.
 - If a build or Morphe CLI apply fails, fix the patch and retry on your own; do not stop to ask.
 - Do not stop after a plan; make the changes, build, and apply them.
 - Finish with a short summary of what you changed and how you verified it.
@@ -1034,7 +1017,6 @@ def cmd_comment_failure() -> None:
         marker in prepare_error.lower()
         for marker in (
             "download failed",
-            "too large",
             "too small",
             "not a zip",
             "not a valid zip",
@@ -1044,10 +1026,8 @@ def cmd_comment_failure() -> None:
     hint = ""
     if download_problem:
         hint = (
-            "\n\nCheck that the URL is a **direct** link to one file (not a preview page) and that "
-            f"the file is no larger than {MAX_APK_MB} MB. If the host does not allow direct "
-            "downloads, upload it to tmpfiles.org, put the `/dl/` link in the issue's URL field, "
-            "then comment here to retry."
+            "\n\nCheck that the URL points to one app file. The agent can resolve supported "
+            "landing pages; otherwise use a direct file link, then comment here to retry."
         )
 
     # Deliberately avoid reposting model output: the agent sees private maintainer instructions.
