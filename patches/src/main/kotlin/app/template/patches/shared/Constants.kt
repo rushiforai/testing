@@ -83,4 +83,16 @@ object Constants {
             )
         )
     )
+
+    val COMPATIBILITY_MINDICATOR = Compatibility(
+        name = "mIndicator",
+        packageName = "com.mobond.mindicator",
+        apkFileType = ApkFileType.APK,
+        appIconColor = 0xC11921,
+        targets = listOf(
+            AppTarget(
+                version = "18.0.371"
+            )
+        )
+    )
 }
