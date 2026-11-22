@@ -1,6 +1,8 @@
 name: CI hardware stats
 
 on:
+  push:
+    branches: [dev]
   workflow_dispatch:
 
 permissions:
