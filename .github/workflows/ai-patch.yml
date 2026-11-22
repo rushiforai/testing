@@ -100,7 +100,9 @@ jobs:
     outputs:
       mode: ${{ steps.prepare.outputs.mode }}
     runs-on: ubuntu-latest
-    timeout-minutes: 200
+    # Must cover the worst case inside this job: ~45 min of setup plus 120 min of agent
+    # plus 60 min of repair, otherwise the job cap kills the run mid-step.
+    timeout-minutes: 260
     permissions:
       contents: read
       issues: read
@@ -129,10 +131,25 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      # Cache the Gradle wrapper, dependencies and local build cache. The action only writes
+      # on the default branch by default; this workflow runs on dev, so opt dev in as well.
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-read-only: ${{ github.ref_name != 'dev' && github.ref_name != 'main' }}
+
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
           node-version: "lts/*"
+
+      # Pin one Python for the whole job. The image default (3.14) has no wheels for the
+      # Pillow/lxml versions the analysis tools pull in, so pip compiles them from source
+      # and fails without the jpeg headers. 3.12 has wheels for both.
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
 
       # Preparation only parses the issue and provides the URL/paths. The agent downloads,
       # resolves landing pages, validates the size/type, and extracts the base APK.
@@ -143,24 +160,40 @@ jobs:
           AGENT_BRIEF: ${{ secrets.AGENT_BRIEF }}
         run: python3 "${RUNNER_TEMP}/ai_patch.py" prepare
 
-      - name: Clone reference example patches
+      # GitHub has no subtree-download endpoint and the repository tarball is several GB.
+      # A tree:0 partial clone fetches refs only (sub-second) and then one pack for the
+      # requested directories, which is the only fast way to get examplepatches alone.
+      # The full examplepatches tree is ~390 MB across 20k+ files and stalls a checkout, so
+      # fetch a small sample of complete, source-rich repos instead of all of it.
+      - name: Download reference example patches
         if: steps.prepare.outputs.mode == 'run'
+        timeout-minutes: 5
+        env:
+          REF_REPO: https://github.com/rushiforai/morphe-archive.git
+          REF_SUBDIR: examplepatches
+          REF_OWNERS: 0xtalos Adiker AmpleReVanced
         run: |
           set -euo pipefail
           export GIT_TERMINAL_PROMPT=0
           REPO_DIR="${RUNNER_TEMP}/morphe-archive"
-          EXAMPLE_SUBDIR="examplepatches"
           rm -rf "${REPO_DIR}"
 
-          # Bound the clone so a network hang cannot consume the whole run.
-          if timeout 180 git clone --depth 1 --filter=blob:none --sparse \
-              "https://github.com/rushiforai/morphe-archive.git" "${REPO_DIR}"; then
-            if timeout 120 git -C "${REPO_DIR}" sparse-checkout set "${EXAMPLE_SUBDIR}"; then
-              echo "EXAMPLE_PATCHES_DIR=${REPO_DIR}/${EXAMPLE_SUBDIR}" >> "$GITHUB_ENV"
-              echo "Example patches available at ${REPO_DIR}/${EXAMPLE_SUBDIR}"
-            fi
+          patterns=()
+          for owner in ${REF_OWNERS}; do
+            patterns+=("${REF_SUBDIR}/${owner}/*")
+          done
+
+          if timeout 60 git clone --depth 1 --filter=tree:0 --sparse --no-checkout \
+              "${REF_REPO}" "${REPO_DIR}" \
+             && timeout 30 git -C "${REPO_DIR}" sparse-checkout set --no-cone "${patterns[@]}" \
+             && timeout 120 git -C "${REPO_DIR}" checkout; then
+            # Drop git metadata: this is read-only reference material, not a repository.
+            rm -rf "${REPO_DIR}/.git"
+            echo "EXAMPLE_PATCHES_DIR=${REPO_DIR}/${REF_SUBDIR}" >> "$GITHUB_ENV"
+            echo "Reference patches: $(find "${REPO_DIR}/${REF_SUBDIR}" -type f | wc -l) files"
           else
-            echo "::warning::Could not clone rushiforai/morphe-archive; continuing without example patches"
+            rm -rf "${REPO_DIR}"
+            echo "::warning::Could not download reference patches; continuing without them"
           fi
 
       - name: Install analysis packages (apt)
@@ -172,6 +205,7 @@ jobs:
             ca-certificates curl git jq unzip zip wget ripgrep \
             cmake ninja-build build-essential pkg-config \
             libicu-dev libcapstone-dev libxml2-dev libxslt1-dev \
+            libjpeg-dev zlib1g-dev \
             python3-dev python3-venv >/dev/null
 
       - name: Install decompilers and native tools
@@ -265,11 +299,22 @@ jobs:
           VENV="${RUNNER_TEMP}/venv"
           python3 -m venv "${VENV}"
           "${VENV}/bin/pip" install --upgrade pip >/dev/null
+
+          # Pillow and lxml are hard requirements: the analysis tools import them, and the
+          # agent needs Pillow to read the app icon colour. Wheels only, so pip never falls
+          # back to a source build on the runner.
+          "${VENV}/bin/pip" install --no-cache-dir --only-binary=:all: pillow lxml
+
           "${VENV}/bin/pip" install --no-cache-dir \
             androguard apkid capstone pyelftools requests
+          # apknife pins its own Pillow/lxml; those pins also ship cp312 wheels.
           "${VENV}/bin/pip" install --no-cache-dir \
             hermes-dec apksigcopier apkutils2 apksigtool droidlysis apknife hbctool \
             || echo "::warning::Some optional Python analysis tools failed to install"
+
+          # Fail setup here, not five minutes into the agent, if the venv lost either module.
+          "${VENV}/bin/python" -c \
+            "import PIL, lxml.etree; print('Pillow', PIL.__version__, 'lxml', lxml.etree.__version__)"
           echo "${VENV}/bin" >> "$GITHUB_PATH"
 
       - name: Install Codex CLI
@@ -332,7 +377,8 @@ jobs:
         # A failed or question-only run must not stop the job: the repair step below gets a
         # chance to fix the working tree, rebuild and re-apply.
         continue-on-error: true
-        timeout-minutes: 80
+        # The 2026-11-22 run spent 68.5 of 80 minutes in the agent; keep real headroom.
+        timeout-minutes: 120
         env:
           AI_GATEWAY_API_KEY: ${{ secrets.AI_API_KEY }}
           AI_MODEL: ${{ secrets.AI_MODEL }}
@@ -678,6 +724,12 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
+
+      # Same Gradle cache as the agent job: this job's bundle build starts cold otherwise.
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-read-only: ${{ github.ref_name != 'dev' && github.ref_name != 'main' }}
 
       - name: Download result
         uses: actions/download-artifact@v4
