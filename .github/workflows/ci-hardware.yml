@@ -1,0 +1,43 @@
+name: CI hardware stats
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stats:
+    name: Runner stats
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Collect hardware and toolchain stats
+        run: |
+          set -euo pipefail
+
+          echo "=== runner ==="
+          echo "name:        ${RUNNER_NAME:-unknown}"
+          echo "environment: ${RUNNER_ENVIRONMENT:-unknown}"
+          echo "image:       ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          uname -a
+          grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release || true
+          echo
+
+          echo "=== cpu ==="
+          nproc
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket|MHz|BogoMIPS|Hypervisor|Virtualization' || true
+          echo
+
+          echo "=== memory ==="
+          free -h
+          echo
+
+          echo "=== disk ==="
+          df -h / /mnt 2>/dev/null || df -h /
+          echo
+
+          echo "=== toolchain ==="
+          java -version 2>&1 | head -3 || true
+          node -v || true
+          python3 -V || true
