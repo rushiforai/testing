@@ -433,13 +433,12 @@ jobs:
           APK_PATH: ${{ steps.prepare.outputs.apk_path }}
           BASE_APK_PATH: ${{ steps.prepare.outputs.base_apk_path }}
           DECOMPILED_DIR: ${{ runner.temp }}/decompiled
-          DEBUG_AGENT_OUTPUT: ${{ github.event.inputs.debug_agent_output || 'false' }}
         run: |
           set -uo pipefail
 
-          # Codex echoes its prompt, which contains the private run brief. Never pipe the
-          # transcript into the Actions log; keep it in runner temp and print only a sanitized
-          # tail of known status lines.
+          # Codex echoes its prompt, which contains the private run brief. The transcript is
+          # never printed raw: it goes through stream_agent_log.py, which drops every line that
+          # matches the brief, and the full copy stays in runner temp.
           LOG="${RUNNER_TEMP}/agent-output.log"
           TASK_SNAPSHOT="${RUNNER_TEMP}/task-private-scan.md"
           : > "$LOG"
@@ -676,14 +675,31 @@ jobs:
               fi
             } >> "${RUNNER_TEMP}/repair-task.md"
 
+            # Same live stream as the main agent: a repair attempt can run for 30+ minutes with
+            # no output, which looks hung and gets cancelled. The prompt carries the private
+            # brief, so the raw transcript stays in runner temp and only sanitized lines print.
             CODEX_LOG="${RUNNER_TEMP}/repair-${attempt}-codex.log"
-            codex_status=0
+            REPAIR_SNAPSHOT="${RUNNER_TEMP}/repair-${attempt}-private-scan.md"
+            : > "$CODEX_LOG"
+            cp "${RUNNER_TEMP}/repair-task.md" "$REPAIR_SNAPSHOT" 2>/dev/null || true
+            start=$(date +%s)
+            (
+              while sleep 30; do
+                bytes=$(wc -c < "$CODEX_LOG" 2>/dev/null || echo 0)
+                echo "::notice::repair agent still running (attempt ${attempt}): $(( $(date +%s) - start ))s elapsed, $(( bytes / 1024 )) KB of output"
+              done
+            ) &
+            heartbeat=$!
             codex exec \
               --sandbox danger-full-access \
               --skip-git-repo-check \
               --model "${AI_MODEL}" \
               --output-last-message "${RUNNER_TEMP}/repair-message-${attempt}.md" \
-              - < "${RUNNER_TEMP}/repair-task.md" > "$CODEX_LOG" 2>&1 || codex_status=$?
+              - < "${RUNNER_TEMP}/repair-task.md" 2>&1 \
+              | tee "$CODEX_LOG" \
+              | python3 -u "${GITHUB_WORKSPACE}/.github/scripts/stream_agent_log.py" "$REPAIR_SNAPSHOT"
+            codex_status=${PIPESTATUS[0]}
+            kill "$heartbeat" 2>/dev/null || true
             echo "Repair Codex attempt ${attempt} exited with status ${codex_status}."
 
             VALIDATE_LOG="${RUNNER_TEMP}/repair-${attempt}-validate.log"
