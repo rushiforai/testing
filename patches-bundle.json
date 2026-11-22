@@ -1,6 +1,6 @@
 {
-  "created_at": "2026-11-21T23:30:51",
-  "description": "## 1.0.0 (2026-11-21)\n\n### ✨ New Features\n\n* **ci:** add autonomous patch pipeline and release signing ([cee8ebd](https://github.com/rushiforai/testing/commit/cee8ebdf1570d9688f1411074ef8ea27b93b2126))",
+  "created_at": "2026-11-22T02:43:07",
+  "description": "## 1.0.0 (2026-11-22)\n\n### ✨ New Features\n\n* **ci:** add autonomous patch pipeline and release signing ([cee8ebd](https://github.com/rushiforai/testing/commit/cee8ebdf1570d9688f1411074ef8ea27b93b2126))",
   "download_url": "https://github.com/rushiforai/testing/releases/download/v1.0.0/patches-1.0.0.mpp",
   "signature_download_url": "",
   "version": "1.0.0",
