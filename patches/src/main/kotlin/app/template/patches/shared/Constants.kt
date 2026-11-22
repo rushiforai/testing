@@ -107,4 +107,16 @@ object Constants {
             )
         )
     )
+
+    val COMPATIBILITY_AAAD = Compatibility(
+        name = "AAAD",
+        packageName = "sksa.aa.customapps",
+        apkFileType = ApkFileType.APK,
+        appIconColor = 0x323133,
+        targets = listOf(
+            AppTarget(
+                version = "2.8.5"
+            )
+        )
+    )
 }
