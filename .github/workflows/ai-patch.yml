@@ -11,7 +11,9 @@ name: AI patch agent
 #   AI_API_KEY         required; OpenAI-compatible API key
 #   AI_MODEL           required; model id
 #   AGENT_BRIEF        required; the only agent brief (AGENTS.md content). Keep it out of the repository.
-#   AI_BASE_URL        optional; defaults to https://tokenharbor.ai/v1
+#   AI_BASE_URL        optional; defaults to https://tokenharbor.ai/v1. Must be an
+#                      OpenAI-compatible root that serves /v1/chat/completions; a bare host
+#                      or the provider's /docs page is normalised to /v1.
 #
 # This file must exist on the repository's default branch for `issues` / `issue_comment` events.
 # Runs are serialized: GitHub Actions keeps one run active and one pending, so a newer pending
@@ -321,7 +323,10 @@ jobs:
         if: steps.prepare.outputs.mode == 'run'
         run: |
           set -euo pipefail
-          npm install --global @openai/codex
+          # Codex 0.95.0 dropped Chat Completions support: `wire_api = "chat"` is a hard error
+          # now and every request goes to /responses. The configured gateway only implements
+          # /v1/chat/completions, so pin the last release that can still talk to it.
+          npm install --global @openai/codex@0.94.0
           codex --version
 
       - name: Configure AI agent
@@ -342,6 +347,19 @@ jobs:
             *) AI_BASE_URL="https://${AI_BASE_URL}" ;;
           esac
 
+          # Codex appends /chat/completions itself, so base_url must be the API root.
+          # Tolerate a pasted docs page (…/docs) or a bare host and normalise both to /v1.
+          while [ "${AI_BASE_URL}" != "${AI_BASE_URL%/}" ]; do
+            AI_BASE_URL="${AI_BASE_URL%/}"
+          done
+          case "${AI_BASE_URL}" in
+            */docs) AI_BASE_URL="${AI_BASE_URL%/docs}/v1" ;;
+          esac
+          case "${AI_BASE_URL#*://}" in
+            */*) ;;
+            *) AI_BASE_URL="${AI_BASE_URL}/v1" ;;
+          esac
+
           mkdir -p "${CODEX_HOME}"
           cat > "${CODEX_HOME}/config.toml" <<EOF
           model = "${AI_MODEL}"
@@ -352,7 +370,7 @@ jobs:
           [model_providers.patch-gateway]
           name = "Patch gateway"
           base_url = "${AI_BASE_URL}"
-          wire_api = "responses"
+          wire_api = "chat"
           env_key = "AI_GATEWAY_API_KEY"
 
           [shell_environment_policy.filters]
