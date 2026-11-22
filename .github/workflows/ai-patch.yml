@@ -780,6 +780,51 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+      # The patched APK is the one thing a tester actually wants to install, and an Actions
+      # artifact always downloads as a zip. Carry it to the publish job (which owns the write
+      # token) so it can be published as a release asset with a direct .apk URL.
+      - name: Collect patched APK
+        id: collect_apk
+        if: always() && steps.prepare.outputs.mode == 'run'
+        run: |
+          set -uo pipefail
+          STATUS=$(cut -d'|' -f1 "${RUNNER_TEMP}/verify-status" 2>/dev/null || true)
+          if [ "$STATUS" != "verified" ]; then
+            echo "Verification status is '${STATUS:-missing}'; no patched APK to publish."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Morphe CLI writes its output next to the input APK or into its own working
+          # directory depending on the build, so take the newest APK that is not an input.
+          PATCHED=$(find "${RUNNER_TEMP}" -maxdepth 3 -type f -name '*.apk' \
+            ! -path "${RUNNER_TEMP}/input/app.apk" \
+            ! -path "${RUNNER_TEMP}/input/base.apk" \
+            -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2-)
+          if [ -z "${PATCHED:-}" ] || [ ! -s "$PATCHED" ]; then
+            echo "::warning::Verification passed but no patched APK was found on the runner."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          APP_NAME=$(jq -r '.app_name // "app"' "${RUNNER_TEMP}/issue.json" 2>/dev/null \
+            | tr -d '\r\n' | sed 's/[^A-Za-z0-9._-]/_/g' | cut -c1-40)
+          [ -n "${APP_NAME}" ] || APP_NAME="app"
+          mkdir -p "${RUNNER_TEMP}/ai-patch-apk"
+          ASSET="${APP_NAME}-issue-${ISSUE_NUMBER}-patched.apk"
+          cp "$PATCHED" "${RUNNER_TEMP}/ai-patch-apk/${ASSET}"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "Collected ${ASSET} ($(du -h "$PATCHED" | cut -f1))"
+
+      - name: Upload patched APK
+        if: always() && steps.collect_apk.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-patch-apk
+          path: ${{ runner.temp }}/ai-patch-apk
+          retention-days: 7
+          if-no-files-found: ignore
+
   publish:
     name: Publish patch
     needs: agent
@@ -822,6 +867,15 @@ jobs:
         with:
           name: ai-patch-result
           path: ${{ runner.temp }}/ai-patch-result
+
+      # Absent when verification was skipped or produced no APK; not an error.
+      - name: Download patched APK
+        id: download_apk
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: ai-patch-apk
+          path: ${{ runner.temp }}/ai-patch-apk
 
       - name: Apply generated patch
         run: |
@@ -904,6 +958,38 @@ jobs:
             || echo "::warning::Could not dispatch release.yml; run it manually"
           gh workflow run open_pull_request.yml --ref dev \
             || echo "::warning::Could not dispatch open_pull_request.yml"
+
+      # A rolling pre-release keeps one direct, stable .apk link per issue: release assets
+      # download as-is, unlike artifacts, which GitHub always wraps in a zip.
+      - name: Publish downloadable APK
+        if: steps.download_apk.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          APK=$(find "${RUNNER_TEMP}/ai-patch-apk" -maxdepth 1 -type f -name '*.apk' | head -n1)
+          if [ -z "${APK:-}" ]; then
+            echo "::warning::The APK artifact was empty; skipping the download link."
+            exit 0
+          fi
+          ASSET=$(basename "$APK")
+
+          if ! gh release view ci-preview >/dev/null 2>&1; then
+            gh release create ci-preview \
+              --prerelease \
+              --title "CI preview APKs" \
+              --notes "Patched APKs built and runtime-verified by the AI patch workflow. Not a Morphe release: the patch bundle itself ships on the normal dev pre-release."
+          fi
+          gh release upload ci-preview "$APK" --clobber
+
+          URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/ci-preview/${ASSET}"
+          echo "APK_URL=${URL}" >> "$GITHUB_ENV"
+          {
+            echo "### 📱 Patched APK"
+            echo ""
+            echo "[Download ${ASSET}](${URL})"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Published ${ASSET} at ${URL}"
 
       - name: Comment on issue
         env:

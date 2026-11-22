@@ -958,6 +958,29 @@ def cmd_comment_success() -> None:
 
     verify_line = verify_summary()
     verify_log = read_text(TMP / "verify.log", 4_000)
+    # Direct .apk URL published as a release asset by the workflow; empty when the APK could
+    # not be published, in which case the tester falls back to patching the .mpp themselves.
+    apk_url = os.environ.get("APK_URL", "").strip()
+    if apk_url:
+        test_section = f"""### 📱 Try the patched APK
+
+[**Download the APK**]({apk_url}) — a direct `.apk`, already patched with this run's bundle.
+
+1. Install it and try the patch. Android may refuse to install it over the store copy;
+   uninstall that copy first if it does.
+2. If it works, reply with exactly **`worked`** and this issue closes automatically.
+3. If something is wrong or missing, reply with the details and the agent will try again.
+
+The link is replaced by the next successful run for this issue.
+"""
+    else:
+        test_section = f"""### How to test
+
+1. Download the newest `dev` pre-release `.mpp` from the [Releases page]({SERVER}/{REPO}/releases).
+2. Patch the APK with Morphe Manager or Morphe Desktop/CLI.
+3. If the patch works, reply with exactly **`worked`** and this issue closes automatically.
+4. If something is wrong or missing, reply with the details and the agent will try again.
+"""
 
     # Deliberately avoid reposting model output: the agent sees private maintainer instructions.
     body = f"""## 🤖 AI patch run finished
@@ -991,13 +1014,7 @@ def cmd_comment_success() -> None:
 """
 
     body += f"""
-### How to test
-
-1. Download the newest `dev` pre-release `.mpp` from the [Releases page]({SERVER}/{REPO}/releases).
-2. Patch the APK with Morphe Manager or Morphe Desktop/CLI.
-3. If the patch works, reply with exactly **`worked`** and this issue closes automatically.
-4. If something is wrong or missing, reply with the details and the agent will try again.
-
+{test_section}
 <sub>Automated run: {run_url()}</sub>
 """
 
