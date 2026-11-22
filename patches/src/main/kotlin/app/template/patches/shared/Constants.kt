@@ -131,4 +131,16 @@ object Constants {
             )
         )
     )
+
+    val COMPATIBILITY_AAAI = Compatibility(
+        name = "AA Apps Installer",
+        packageName = "com.aaai.app",
+        apkFileType = ApkFileType.APK,
+        appIconColor = 0x19954D,
+        targets = listOf(
+            AppTarget(
+                version = "1.1.0"
+            )
+        )
+    )
 }
