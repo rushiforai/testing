@@ -862,10 +862,13 @@ jobs:
 
       - name: Upload patched APK
         if: always() && steps.collect_apk.outputs.found == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: ai-patch-apk
-          path: ${{ runner.temp }}/ai-patch-apk
+          # `archive: false` stores the file as-is, so the artifact on the run page is the .apk
+          # itself rather than a zip. Only one file can be uploaded this way, and the file's
+          # name becomes the artifact name (`name` is ignored).
+          path: ${{ runner.temp }}/ai-patch-apk/*.apk
+          archive: false
           retention-days: 7
           if-no-files-found: ignore
 
