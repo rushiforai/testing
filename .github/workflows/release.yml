@@ -18,6 +18,10 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # semantic-release reads the last release tag from the local clone. Without the
+          # tags it re-derives a version that already exists and dies on `git tag <name>`,
+          # leaving a stray "chore: Release" commit behind on every push.
+          fetch-tags: true
 
       - name: Setup Java
         uses: actions/setup-java@v6
