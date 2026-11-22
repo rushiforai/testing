@@ -62,6 +62,33 @@
         }
       ],
       "options": []
+    },
+    {
+      "name": "Unlock premium",
+      "description": "Unlocks all Monet Premium features without a purchase.",
+      "default": true,
+      "category": null,
+      "compatiblePackages": [
+        {
+          "packageName": "com.klevico.monet",
+          "name": "Monet",
+          "description": null,
+          "apkFileType": "APK",
+          "appIconColor": "#252F4F",
+          "signatures": null,
+          "formFactor": "MOBILE",
+          "targets": [
+            {
+              "version": "1.1.2",
+              "versionCodes": null,
+              "isExperimental": false,
+              "minSdk": null,
+              "description": null
+            }
+          ]
+        }
+      ],
+      "options": []
     }
   ]
 }

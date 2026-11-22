@@ -19,12 +19,13 @@ Click the button below, or manually add this repo url to Morphe Manager: https:/
 ## 🩹 Patches list
 
 <!-- PATCHES_START EXPANDED -->
-> **[v1.0.0-dev.2](https://github.com/rushiforai/testing/releases/tag/v1.0.0-dev.2)**&nbsp;&nbsp;&middot;&nbsp;&nbsp;`dev`&nbsp;&nbsp;&middot;&nbsp;&nbsp;**2 patches** across **2 apps**&nbsp;&nbsp;&middot;&nbsp;&nbsp;[Full details](PATCHES.md)
+> **[v1.0.0-dev.2](https://github.com/rushiforai/testing/releases/tag/v1.0.0-dev.2)**&nbsp;&nbsp;&middot;&nbsp;&nbsp;`dev`&nbsp;&nbsp;&middot;&nbsp;&nbsp;**3 patches** across **3 apps**&nbsp;&nbsp;&middot;&nbsp;&nbsp;[Full details](PATCHES.md)
 
 | # | App | Patches | Version | Package |
 |---|---|---|---|---|
 | 1 | [**mIndicator**](PATCHES.md#mindicator-commobondmindicator) | 1 | `18.0.371` | [`com.mobond.mindicator`](https://play.google.com/store/apps/details?id=com.mobond.mindicator) |
-| 2 | [**XYZ app**](PATCHES.md#xyz-app-comexampleapp) | 1 | `2.0.0`, `1.0.2` | [`com.example.app`](https://play.google.com/store/apps/details?id=com.example.app) |
+| 2 | [**Monet**](PATCHES.md#monet-comklevicomonet) | 1 | `1.1.2` | [`com.klevico.monet`](https://play.google.com/store/apps/details?id=com.klevico.monet) |
+| 3 | [**XYZ app**](PATCHES.md#xyz-app-comexampleapp) | 1 | `2.0.0`, `1.0.2` | [`com.example.app`](https://play.google.com/store/apps/details?id=com.example.app) |
 <!-- PATCHES_END -->
 
 ### 🛠️ Building locally
