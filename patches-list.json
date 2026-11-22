@@ -35,6 +35,33 @@
         }
       ],
       "options": []
+    },
+    {
+      "name": "Remove ads",
+      "description": "Removes banner, native, interstitial and exit screen ads.",
+      "default": true,
+      "category": null,
+      "compatiblePackages": [
+        {
+          "packageName": "com.mobond.mindicator",
+          "name": "mIndicator",
+          "description": null,
+          "apkFileType": "APK",
+          "appIconColor": "#C11921",
+          "signatures": null,
+          "formFactor": "MOBILE",
+          "targets": [
+            {
+              "version": "18.0.371",
+              "versionCodes": null,
+              "isExperimental": false,
+              "minSdk": null,
+              "description": null
+            }
+          ]
+        }
+      ],
+      "options": []
     }
   ]
 }
