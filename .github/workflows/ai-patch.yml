@@ -825,6 +825,50 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+      # The runtime-verified APK, so a tester can install what the run produced without
+      # rebuilding the .mpp. GitHub always wraps artifacts in a zip; there is no raw-file URL.
+      - name: Collect patched APK
+        id: collect_apk
+        if: always() && steps.prepare.outputs.mode == 'run'
+        run: |
+          set -uo pipefail
+          STATUS=$(cut -d'|' -f1 "${RUNNER_TEMP}/verify-status" 2>/dev/null || true)
+          if [ "$STATUS" != "verified" ]; then
+            echo "Verification status is '${STATUS:-missing}'; no patched APK to publish."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Morphe CLI writes its output next to the input APK or into its own working
+          # directory depending on the build, so take the newest APK that is not an input.
+          PATCHED=$(find "${RUNNER_TEMP}" -maxdepth 3 -type f -name '*.apk' \
+            ! -path "${RUNNER_TEMP}/input/app.apk" \
+            ! -path "${RUNNER_TEMP}/input/base.apk" \
+            -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2-)
+          if [ -z "${PATCHED:-}" ] || [ ! -s "$PATCHED" ]; then
+            echo "::warning::Verification passed but no patched APK was found on the runner."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          APP_NAME=$(jq -r '.app_name // "app"' "${RUNNER_TEMP}/issue.json" 2>/dev/null \
+            | tr -d '\r\n' | sed 's/[^A-Za-z0-9._-]/_/g' | cut -c1-40)
+          [ -n "${APP_NAME}" ] || APP_NAME="app"
+          mkdir -p "${RUNNER_TEMP}/ai-patch-apk"
+          ASSET="${APP_NAME}-issue-${ISSUE_NUMBER}-patched.apk"
+          cp "$PATCHED" "${RUNNER_TEMP}/ai-patch-apk/${ASSET}"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "Collected ${ASSET} ($(du -h "$PATCHED" | cut -f1))"
+
+      - name: Upload patched APK
+        if: always() && steps.collect_apk.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-patch-apk
+          path: ${{ runner.temp }}/ai-patch-apk
+          retention-days: 7
+          if-no-files-found: ignore
+
   publish:
     name: Publish patch
     needs: agent
