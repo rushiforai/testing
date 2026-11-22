@@ -28,6 +28,11 @@ on:
         description: Issue number to process
         required: true
         type: number
+      debug_agent_output:
+        description: Stream sanitized Codex output to the Actions log
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: ai-patch
@@ -337,6 +342,7 @@ jobs:
           APK_URL: ${{ steps.prepare.outputs.apk_url }}
           APK_PATH: ${{ steps.prepare.outputs.apk_path }}
           BASE_APK_PATH: ${{ steps.prepare.outputs.base_apk_path }}
+          DEBUG_AGENT_OUTPUT: ${{ github.event.inputs.debug_agent_output || 'false' }}
         run: |
           set -uo pipefail
 
@@ -349,12 +355,25 @@ jobs:
           cp "${RUNNER_TEMP}/task.md" "$TASK_SNAPSHOT" 2>/dev/null || true
 
           status=0
-          codex exec \
-            --sandbox danger-full-access \
-            --skip-git-repo-check \
-            --model "${AI_MODEL}" \
-            --output-last-message "${RUNNER_TEMP}/agent-message.md" \
-            - < "${RUNNER_TEMP}/task.md" > "$LOG" 2>&1 || status=$?
+          if [ "${DEBUG_AGENT_OUTPUT:-false}" = "true" ]; then
+            echo "::notice::Streaming sanitized Codex output because debug_agent_output is enabled."
+            codex exec \
+              --sandbox danger-full-access \
+              --skip-git-repo-check \
+              --model "${AI_MODEL}" \
+              --output-last-message "${RUNNER_TEMP}/agent-message.md" \
+              - < "${RUNNER_TEMP}/task.md" 2>&1 \
+              | tee "$LOG" \
+              | python3 -u "${GITHUB_WORKSPACE}/.github/scripts/stream_agent_log.py" "$TASK_SNAPSHOT"
+            status=${PIPESTATUS[0]}
+          else
+            codex exec \
+              --sandbox danger-full-access \
+              --skip-git-repo-check \
+              --model "${AI_MODEL}" \
+              --output-last-message "${RUNNER_TEMP}/agent-message.md" \
+              - < "${RUNNER_TEMP}/task.md" > "$LOG" 2>&1 || status=$?
+          fi
 
           echo "Codex exited with status ${status}. Full output is in the runner temp directory."
           python3 - "$LOG" "$TASK_SNAPSHOT" <<'PY' || true
