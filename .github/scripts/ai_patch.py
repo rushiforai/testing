@@ -582,6 +582,12 @@ def cmd_prepare() -> None:
         "clones them before you start, and it may be unset if the clone failed). They are grouped "
         "by app: use them to study layout, fingerprint style and compatibility declarations."
     )
+    reference_matches = os.environ.get("REFERENCE_MATCHES", "").strip()
+    if reference_matches:
+        reference_line += (
+            f"\n- Example patch directories matched to this issue's app, one path per line: "
+            f"`{reference_matches}`. Read at least two of them before writing patch code."
+        )
 
     apk_section = f"""## APK download and workspace (your responsibility)
 

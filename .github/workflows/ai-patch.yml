@@ -161,18 +161,24 @@ jobs:
       # A tree:0 partial clone fetches refs only (sub-second) and then one pack for the
       # requested directories, which is the only fast way to get examplepatches alone.
       # The full examplepatches tree is ~390 MB across 20k+ files and stalls a checkout, so
-      # fetch a small sample of complete, source-rich repos instead of all of it.
+      # fetch a small sample of complete, source-rich repos plus the app dirs this issue needs.
+      # The archive has ~700 owners (285k files): a fixed sample contained zero files for every
+      # app requested so far, so the fixed owners alone are only a general API reference.
       - name: Download reference example patches
         if: steps.prepare.outputs.mode == 'run'
-        timeout-minutes: 5
+        timeout-minutes: 8
         env:
           REF_REPO: https://github.com/rushiforai/morphe-archive.git
           REF_SUBDIR: examplepatches
           REF_OWNERS: 0xtalos Adiker AmpleReVanced
+          APP_NAME: ${{ steps.prepare.outputs.app_name }}
+          PACKAGE_NAME: ${{ steps.prepare.outputs.package_name }}
         run: |
           set -euo pipefail
           export GIT_TERMINAL_PROMPT=0
           REPO_DIR="${RUNNER_TEMP}/morphe-archive"
+          MATCHES="${RUNNER_TEMP}/reference-paths.txt"
+          : > "$MATCHES"
           rm -rf "${REPO_DIR}"
 
           patterns=()
@@ -180,14 +186,49 @@ jobs:
             patterns+=("${REF_SUBDIR}/${owner}/*")
           done
 
+          # Keyword matcher for the app in this issue: the package's distinctive segments and
+          # the app name. Generic words are dropped so a keyword cannot select half the archive.
+          keywords=$(
+            printf '%s\n%s\n' "${PACKAGE_NAME:-}" "${APP_NAME:-}" \
+              | tr '[:upper:]' '[:lower:]' \
+              | tr -cs 'a-z0-9' '\n' \
+              | awk 'length($0) >= 4' \
+              | grep -vxE 'com|org|net|android|app|apps|apk|patch|patches|free|plus|premium|unlock|pro' \
+              | sort -u | paste -sd'|' - || true
+          )
+
           if timeout 60 git clone --depth 1 --filter=tree:0 --sparse --no-checkout \
-              "${REF_REPO}" "${REPO_DIR}" \
-             && timeout 30 git -C "${REPO_DIR}" sparse-checkout set --no-cone "${patterns[@]}" \
-             && timeout 120 git -C "${REPO_DIR}" checkout; then
-            # Drop git metadata: this is read-only reference material, not a repository.
-            rm -rf "${REPO_DIR}/.git"
-            echo "EXAMPLE_PATCHES_DIR=${REPO_DIR}/${REF_SUBDIR}" >> "$GITHUB_ENV"
-            echo "Reference patches: $(find "${REPO_DIR}/${REF_SUBDIR}" -type f | wc -l) files"
+              "${REF_REPO}" "${REPO_DIR}"; then
+            # Listing the tree fetches tree objects only, no file contents: cheap enough to
+            # select the few directories that mention this app before checking anything out.
+            if [ -n "$keywords" ] \
+               && timeout 120 git -C "${REPO_DIR}" ls-tree -r --name-only HEAD "${REF_SUBDIR}/" \
+                    > "${RUNNER_TEMP}/reference-tree.txt" 2>/dev/null; then
+              # A whole path component, not a substring: `proton` must not match ProtoNode.java
+              # and `monet` must not match MonetizationPatch.kt.
+              grep -iE "$keywords" "${RUNNER_TEMP}/reference-tree.txt" \
+                | awk -F/ -v kw="^($keywords)$" '
+                    { n = split($0, part, "/")
+                      for (i = 1; i <= n; i++)
+                        if (tolower(part[i]) ~ kw) { print; next } }' \
+                | xargs -r -n 1 dirname | sort -u | head -n 40 > "$MATCHES" || true
+            fi
+            while read -r hit; do
+              [ -n "$hit" ] && patterns+=("${hit}/*")
+            done < "$MATCHES"
+
+            if timeout 180 git -C "${REPO_DIR}" sparse-checkout set --no-cone "${patterns[@]}" \
+               && timeout 180 git -C "${REPO_DIR}" checkout; then
+              # Drop git metadata: this is read-only reference material, not a repository.
+              rm -rf "${REPO_DIR}/.git"
+              echo "EXAMPLE_PATCHES_DIR=${REPO_DIR}/${REF_SUBDIR}" >> "$GITHUB_ENV"
+              echo "REFERENCE_MATCHES=${MATCHES}" >> "$GITHUB_ENV"
+              echo "Reference patches: $(find "${REPO_DIR}/${REF_SUBDIR}" -type f | wc -l) files"
+              echo "App-matching reference dirs for '${APP_NAME}': $(wc -l < "$MATCHES")"
+            else
+              rm -rf "${REPO_DIR}"
+              echo "::warning::Could not download reference patches; continuing without them"
+            fi
           else
             rm -rf "${REPO_DIR}"
             echo "::warning::Could not download reference patches; continuing without them"
@@ -408,6 +449,10 @@ jobs:
             few lines you are reasoning about.
           - Do not re-verify your own patch by decompiling a second time. The workflow runs its own
             verification after you finish; stop as soon as the patch builds and applies.
+          - Before writing patch code, read at least two reference patches for this app in one
+            batched command: the paths in `$REFERENCE_MATCHES` first, since they are matched to
+            this issue's app, then `$EXAMPLE_PATCHES_DIR` for general API style. Skip the step
+            only when both are unset or empty.
 
           ## Git commit rules
 
