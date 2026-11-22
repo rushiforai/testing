@@ -40,6 +40,16 @@
 
 ## [1.0.0-dev.2](https://github.com/rushiforai/testing/compare/v1.0.0-dev.1...v1.0.0-dev.2) (2026-11-22)
 
+### ✨ New Features
+
+* **patches:** add m-indicator patch ([#2](https://github.com/rushiforai/testing/issues/2)) ([f6f2107](https://github.com/rushiforai/testing/commit/f6f2107fcc71eeb2daf31c2c2553233827cb7de3))
+
+### 🐛 Bug Fixes
+
+* **ci:** let the agent download and validate APKs ([8e38b92](https://github.com/rushiforai/testing/commit/8e38b929ac316463bca909d9dbd73a68c15c6c1e))
+
+## [1.0.0-dev.2](https://github.com/rushiforai/testing/compare/v1.0.0-dev.1...v1.0.0-dev.2) (2026-11-22)
+
 ### 🐛 Bug Fixes
 
 * **ci:** let the agent download and validate APKs ([8e38b92](https://github.com/rushiforai/testing/commit/8e38b929ac316463bca909d9dbd73a68c15c6c1e))
