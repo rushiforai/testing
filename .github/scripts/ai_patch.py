@@ -538,50 +538,18 @@ def cmd_prepare() -> None:
     write_output("package_name", requested_package)
     write_output("apk_url", apk_url)
 
-    # Download before the agent starts so the base APK can be decompiled once and reused.
-    # If the download fails the old contract stands: the agent downloads and validates it.
+    # Preparation deliberately does not download the APK. The agent resolves the link,
+    # downloads it, enforces the size/type limits, and extracts the base APK.
     input_dir = TMP / "input"
     shutil.rmtree(input_dir, ignore_errors=True)
     input_dir.mkdir(parents=True, exist_ok=True)
     apk_path = input_dir / "app.apk"
     base_apk_path = input_dir / "base.apk"
 
-    fetched: dict[str, object] = {}
-    try:
-        size, file_type, apk_path, base_apk_path, bundle_dir = download_app_file(
-            apk_url, input_dir / "app"
-        )
-        package, version = apk_metadata(base_apk_path)
-        if package and package != requested_package:
-            raise RuntimeError(
-                f"downloaded base APK is {package}, the issue asks for {requested_package}"
-            )
-        fetched = {
-            "file_type": file_type,
-            "apk_size": size,
-            "apk_sha256": hashlib.sha256(apk_path.read_bytes()).hexdigest(),
-            "bundle_dir": str(bundle_dir) if bundle_dir else "",
-            "apk_version": version or requested_version,
-            "package_name": package or requested_package,
-        }
-        log(f"Downloaded {file_type} ({size} bytes) for pre-decompiling")
-    except SystemExit:
-        PREPARE_ERROR.unlink(missing_ok=True)
-        log("Could not download the app file in prepare; the agent will download it.")
-    except Exception as error:  # noqa: BLE001 - network, disk and validation errors
-        PREPARE_ERROR.unlink(missing_ok=True)
-        log(f"Could not download the app file in prepare ({error}); the agent will.")
-
-    if not fetched:
-        shutil.rmtree(input_dir, ignore_errors=True)
-        input_dir.mkdir(parents=True, exist_ok=True)
-        apk_path = input_dir / "app.apk"
-        base_apk_path = input_dir / "base.apk"
-
-    write_output("apk_version", fetched.get("apk_version", requested_version))
+    write_output("apk_version", requested_version)
     write_output("apk_path", apk_path)
     write_output("base_apk_path", base_apk_path)
-    write_output("file_type", fetched.get("file_type", "UNKNOWN"))
+    write_output("file_type", "UNKNOWN")
 
     meta = {
         "issue_number": number,
@@ -591,15 +559,15 @@ def cmd_prepare() -> None:
         "app_name": app_name,
         "package_name": requested_package,
         "requested_package_name": requested_package,
-        "apk_version": fetched.get("apk_version") or requested_version,
+        "apk_version": requested_version,
         "requested_version": requested_version,
         "apk_url": apk_url,
         "apk_path": str(apk_path),
         "base_apk_path": str(base_apk_path),
-        "bundle_dir": fetched.get("bundle_dir", ""),
-        "file_type": fetched.get("file_type", "UNKNOWN"),
-        "apk_sha256": fetched.get("apk_sha256", ""),
-        "apk_size": fetched.get("apk_size", 0),
+        "bundle_dir": "",
+        "file_type": "UNKNOWN",
+        "apk_sha256": "",
+        "apk_size": 0,
         "request": request_text,
         "feedback": feedback,
     }
@@ -615,35 +583,26 @@ def cmd_prepare() -> None:
         "by app: use them to study layout, fingerprint style and compatibility declarations."
     )
 
-    if fetched:
-        apk_section = f"""## APK (already downloaded by the workflow)
-
-- URL: `{apk_url}`
-- File: `{apk_path}` ({fetched['file_type']}, {fetched['apk_size']} bytes)
-- Base APK: `{base_apk_path}`
-- SHA256: `{fetched['apk_sha256']}`
-
-The workflow already downloaded, validated and extracted this file, so do not download it
-again and do not re-read the URL. The base APK is pre-decompiled at `{TMP / 'decompiled'}`;
-read smali from that tree and do not run `apktool d` again unless it is missing.
-
-- Package confirmed: `{fetched['package_name']}`
-- Use `apkFileType = ApkFileType.{fetched['file_type']}` in the `Compatibility` declaration.
-- `{apk_path}` is the exact file Morphe CLI will patch.
-- `{TMP / 'issue.json'}` already records the detected package, version and file type.
-"""
-    else:
-        apk_section = f"""## APK download (your responsibility)
+    apk_section = f"""## APK download and workspace (your responsibility)
 
 - URL: `{apk_url}`
 - Download destination: `{apk_path}`
 - Base APK destination: `{base_apk_path}`
+- Decompiled tree: `{TMP / 'decompiled'}` — create it once, then reuse it for everything
 
-The workflow could not download the app file, so download and validate it yourself.
+The workflow does not download the app file. Download and validate it yourself.
 The URL may be a file-host landing page; resolve the actual file link (for
 tmpfiles.org, follow the page's signed "Download" link). Require a valid ZIP/APK.
 Detect APK/APKM/XAPK/APKS. For a bundle, keep the original at `{apk_path}` and
 extract the base APK to `{base_apk_path}`.
+
+Then decompile exactly once:
+
+    apktool d -f -o "{TMP / 'decompiled'}" "{base_apk_path}"
+
+Every later step — smali search, fingerprint building, checking your own edit — reads from
+`{TMP / 'decompiled'}`. Never run `apktool d` a second time and never unpack to another
+directory: a repeat decompile costs a minute and tells you nothing the first one did not.
 
 Verify that the base APK package is `{requested_package}`. If it is different,
 stop with a clear mismatch. Before finishing, update `{TMP / 'issue.json'}` with

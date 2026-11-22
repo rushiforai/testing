@@ -319,27 +319,6 @@ jobs:
             "import PIL, lxml.etree; print('Pillow', PIL.__version__, 'lxml', lxml.etree.__version__)"
           echo "${VENV}/bin" >> "$GITHUB_PATH"
 
-      # Decompile once, up front. The agent otherwise runs `apktool d` three times (analyse,
-      # verify, re-verify): 1-2 minutes of the run plus several wasted turns.
-      - name: Pre-decompile APK for the agent
-        id: decompile
-        if: steps.prepare.outputs.mode == 'run'
-        timeout-minutes: 10
-        env:
-          BASE_APK_PATH: ${{ steps.prepare.outputs.base_apk_path }}
-        run: |
-          set -euo pipefail
-          OUT="${RUNNER_TEMP}/decompiled"
-          rm -rf "$OUT"
-          if [ -n "${BASE_APK_PATH:-}" ] && [ -f "${BASE_APK_PATH}" ] \
-             && timeout 600 apktool d -f -o "$OUT" "$BASE_APK_PATH" >/dev/null 2>&1; then
-            echo "DECOMPILED_DIR=${OUT}" >> "$GITHUB_ENV"
-            echo "Pre-decompiled $(find "$OUT" -name '*.smali' | wc -l) smali files into ${OUT}"
-          else
-            rm -rf "$OUT"
-            echo "::warning::Pre-decompile failed; the agent will decompile the APK itself"
-          fi
-
       - name: Install Codex CLI
         if: steps.prepare.outputs.mode == 'run'
         run: |
@@ -411,8 +390,10 @@ jobs:
 
           - Batch shell work. Write one script per phase and run it once. Never spend a turn on a
             single grep, ls, cat or file read that the previous command could have covered.
-          - The base APK is already decompiled at ${RUNNER_TEMP}/decompiled. Read smali from there.
-            Do not run "apktool d" again unless that directory is missing.
+          - Decompile exactly once, straight after the base APK exists, into ${RUNNER_TEMP}/decompiled:
+            apktool d -f -o "${RUNNER_TEMP}/decompiled" "${RUNNER_TEMP}/input/base.apk". Every later
+            search and check reads that tree (DECOMPILED_DIR points there too). Never run "apktool d"
+            a second time and never unpack to another directory.
           - Never print file contents or full directory listings. Print counts, paths, and only the
             few lines you are reasoning about.
           - Do not re-verify your own patch by decompiling a second time. The workflow runs its own
@@ -456,6 +437,7 @@ jobs:
           APK_URL: ${{ steps.prepare.outputs.apk_url }}
           APK_PATH: ${{ steps.prepare.outputs.apk_path }}
           BASE_APK_PATH: ${{ steps.prepare.outputs.base_apk_path }}
+          DECOMPILED_DIR: ${{ runner.temp }}/decompiled
           DEBUG_AGENT_OUTPUT: ${{ github.event.inputs.debug_agent_output || 'false' }}
         run: |
           set -uo pipefail
