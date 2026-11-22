@@ -295,6 +295,21 @@ jobs:
           set -euo pipefail
           VENV="${RUNNER_TEMP}/venv"
           python3 -m venv "${VENV}"
+
+          # Guard the interpreter. apknife pins lxml==5.3.1, which ships no cp314 wheel, so a
+          # venv on the image default (3.14) falls back to a source build and dies on libxml2 -
+          # that is exactly how run 44986227483 lost apknife, droidlysis and hbctool.
+          "${VENV}/bin/python" - <<'PY'
+          import sys
+
+          if sys.version_info[:2] != (3, 12):
+              raise SystemExit(
+                  f"venv python is {sys.version.split()[0]}, expected 3.12: lxml 5.3.1 has "
+                  "no wheel for it and its source build fails without matching headers"
+              )
+          print(f"venv python {sys.version.split()[0]}")
+          PY
+
           "${VENV}/bin/pip" install --upgrade pip >/dev/null
 
           # Pillow and lxml are hard requirements: the analysis tools import them, and the
@@ -690,7 +705,9 @@ jobs:
               done
             ) &
             heartbeat=$!
-            codex exec \
+            # Bound each attempt. Unbounded, one stuck turn ate the whole 60-minute step in
+            # run 44986227483 and attempt 2 never ran. 2 x 25 min still fits the step.
+            timeout 1500 codex exec \
               --sandbox danger-full-access \
               --skip-git-repo-check \
               --model "${AI_MODEL}" \
@@ -700,6 +717,9 @@ jobs:
               | python3 -u "${GITHUB_WORKSPACE}/.github/scripts/stream_agent_log.py" "$REPAIR_SNAPSHOT"
             codex_status=${PIPESTATUS[0]}
             kill "$heartbeat" 2>/dev/null || true
+            if [ "$codex_status" = "124" ]; then
+              echo "::warning::Repair attempt ${attempt} hit the 25-minute cap and was stopped."
+            fi
             echo "Repair Codex attempt ${attempt} exited with status ${codex_status}."
 
             VALIDATE_LOG="${RUNNER_TEMP}/repair-${attempt}-validate.log"
