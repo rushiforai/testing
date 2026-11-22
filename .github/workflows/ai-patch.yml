@@ -97,9 +97,9 @@ jobs:
     outputs:
       mode: ${{ steps.prepare.outputs.mode }}
     runs-on: ubuntu-latest
-    # Must cover the worst case inside this job: ~45 min of setup plus 120 min of agent
-    # plus 60 min of repair, otherwise the job cap kills the run mid-step.
-    timeout-minutes: 260
+    # 360 is the hard cap for a GitHub-hosted job, so the budget is: ~2 min of setup plus
+    # 300 min of agent plus 55 min of repair plus the packaging tail.
+    timeout-minutes: 360
     permissions:
       contents: read
       issues: read
@@ -436,8 +436,9 @@ jobs:
         # A failed or question-only run must not stop the job: the repair step below gets a
         # chance to fix the working tree, rebuild and re-apply.
         continue-on-error: true
-        # The 2026-11-22 run spent 68.5 of 80 minutes in the agent; keep real headroom.
-        timeout-minutes: 120
+        # As much as the 360-minute job cap leaves after setup and repair: a hard patch that
+        # needs many model turns must never be killed mid-thought.
+        timeout-minutes: 300
         env:
           AI_GATEWAY_API_KEY: ${{ secrets.AI_API_KEY }}
           AI_MODEL: ${{ secrets.AI_MODEL }}
@@ -631,7 +632,8 @@ jobs:
            steps.validate_changes.outcome == 'failure' ||
            steps.build_bundle.outcome == 'failure' ||
            steps.verify_patch.outcome == 'failure')
-        timeout-minutes: 60
+        # 2 attempts x 25 min plus the validate/build/verify tail, inside the job cap.
+        timeout-minutes: 55
         env:
           AI_GATEWAY_API_KEY: ${{ secrets.AI_API_KEY }}
           AI_MODEL: ${{ secrets.AI_MODEL }}
