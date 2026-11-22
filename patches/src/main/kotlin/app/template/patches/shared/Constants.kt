@@ -95,4 +95,16 @@ object Constants {
             )
         )
     )
+
+    val COMPATIBILITY_MONET = Compatibility(
+        name = "Monet",
+        packageName = "com.klevico.monet",
+        apkFileType = ApkFileType.APK,
+        appIconColor = 0x252F4F,
+        targets = listOf(
+            AppTarget(
+                version = "1.1.2"
+            )
+        )
+    )
 }
