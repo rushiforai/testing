@@ -510,24 +510,65 @@ jobs:
           # runner temp and the whole run was lost as a result. stream_agent_log.py drops
           # every line that matches the private brief, and the heartbeat keeps the log
           # alive while codex is thinking instead of printing.
+          # A wedged Codex must not burn the step budget. Run 44986227483 printed nothing for
+          # 52 minutes, made zero tool calls, then exited 1, and the repair step idled for its
+          # whole 60-minute cap afterwards. Kill the process as soon as it stops progressing.
+          STREAM="${RUNNER_TEMP}/agent-stream.log"
+          STALL_LIMIT="${AGENT_STALL_LIMIT:-900}"
+          FIRST_TOOL_LIMIT="${AGENT_FIRST_TOOL_LIMIT:-900}"
+          WATCH_INTERVAL="${AGENT_WATCH_INTERVAL:-30}"
+          : > "$STREAM"
+
           start=$(date +%s)
-          (
-            while sleep 30; do
-              bytes=$(wc -c < "$LOG" 2>/dev/null || echo 0)
-              echo "::notice::agent still running: $(( $(date +%s) - start ))s elapsed, $(( bytes / 1024 )) KB of output"
-            done
-          ) &
-          heartbeat=$!
           codex exec \
             --sandbox danger-full-access \
             --skip-git-repo-check \
             --model "${AI_MODEL}" \
             --output-last-message "${RUNNER_TEMP}/agent-message.md" \
-            - < "${RUNNER_TEMP}/task.md" 2>&1 \
-            | tee "$LOG" \
-            | python3 -u "${GITHUB_WORKSPACE}/.github/scripts/stream_agent_log.py" "$TASK_SNAPSHOT"
-          status=${PIPESTATUS[0]}
-          kill "$heartbeat" 2>/dev/null || true
+            - < "${RUNNER_TEMP}/task.md" > "$LOG" 2>&1 &
+          codex_pid=$!
+
+          # Show progress while it runs. The sanitized copy is kept so a failure can be
+          # diagnosed from the run's artifacts instead of an empty log.
+          tail -n +1 -F "$LOG" --pid="$codex_pid" 2>/dev/null \
+            | python3 -u "${GITHUB_WORKSPACE}/.github/scripts/stream_agent_log.py" "$TASK_SNAPSHOT" \
+            | tee -a "$STREAM" &
+          stream_pid=$!
+
+          acted=0
+          stalled=""
+          last=-1
+          stall=0
+          while kill -0 "$codex_pid" 2>/dev/null; do
+            sleep "$WATCH_INTERVAL"
+            size=$(wc -c < "$LOG" 2>/dev/null || echo 0)
+            if [ "$size" -eq "$last" ]; then stall=$((stall + WATCH_INTERVAL)); else stall=0; last=$size; fi
+            if grep -qE '^(exec|apply_patch)$' "$LOG" 2>/dev/null; then acted=1; fi
+            echo "::notice::agent running: $(( $(date +%s) - start ))s elapsed, $(( size / 1024 )) KB output, ${stall}s stale, tool calls: $([ "$acted" -eq 1 ] && echo yes || echo no)"
+            if [ "$stall" -ge "$STALL_LIMIT" ]; then
+              stalled="no new output for ${stall}s"
+              break
+            fi
+            if [ "$acted" -eq 0 ] && [ $(( $(date +%s) - start )) -ge "$FIRST_TOOL_LIMIT" ]; then
+              stalled="no tool call in ${FIRST_TOOL_LIMIT}s"
+              break
+            fi
+          done
+
+          if [ -n "$stalled" ]; then
+            echo "::error::Agent wedged (${stalled}); killing it instead of waiting for the step timeout."
+            kill -TERM "$codex_pid" 2>/dev/null || true
+            sleep 5
+            kill -KILL "$codex_pid" 2>/dev/null || true
+          fi
+
+          # `bash -e` is the step shell: a bare `wait` on a killed child would abort the
+          # script here and skip the outputs below.
+          status=0
+          wait "$codex_pid" 2>/dev/null || status=$?
+          if [ -n "$stalled" ]; then status=1; fi
+          sleep 2
+          kill "$stream_pid" 2>/dev/null || true
 
           echo "Codex exited with status ${status}. Full output is in the runner temp directory."
           python3 - "$LOG" "$TASK_SNAPSHOT" <<'PY' || true
@@ -628,6 +669,17 @@ jobs:
               print("--- no safe agent output lines to display ---")
           PY
 
+          # A failed run that never called a tool and changed nothing cannot be repaired:
+          # retrying it just idles for another block of the step budget.
+          if grep -qE '^(exec|apply_patch)$' "$LOG" 2>/dev/null; then acted=1; fi
+          changes=$(git status --porcelain -uall 2>/dev/null | wc -l)
+          if [ "$status" -ne 0 ] && [ "$acted" -eq 0 ] && [ "$changes" -eq 0 ]; then
+            echo "acted=no" >> "$GITHUB_OUTPUT"
+            echo "::error::The agent never acted (exit ${status}, no tool calls, no file changes); skipping repair."
+          else
+            echo "acted=yes" >> "$GITHUB_OUTPUT"
+          fi
+
           exit "$status"
 
       - name: Validate generated changes
@@ -673,6 +725,7 @@ jobs:
       - name: Repair patch after failed verification
         if: |
           steps.prepare.outputs.mode == 'run' &&
+          steps.agent.outputs.acted != 'no' &&
           (steps.agent.outcome == 'failure' ||
            steps.validate_changes.outcome == 'failure' ||
            steps.build_bundle.outcome == 'failure' ||
@@ -814,6 +867,11 @@ jobs:
           done
           if [ -f "${RUNNER_TEMP}/verify.log" ]; then
             tail -c 100000 "${RUNNER_TEMP}/verify.log" > "${RUNNER_TEMP}/ai-patch-result/verify.log" || true
+          fi
+          # Sanitized agent transcript: already stripped of the private brief, so a failed run
+          # can be diagnosed from the artifact instead of an empty log.
+          if [ -f "${RUNNER_TEMP}/agent-stream.log" ]; then
+            tail -c 200000 "${RUNNER_TEMP}/agent-stream.log" > "${RUNNER_TEMP}/ai-patch-result/agent-stream.log" || true
           fi
 
       - name: Upload result
