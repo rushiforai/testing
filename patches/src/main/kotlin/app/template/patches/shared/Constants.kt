@@ -119,4 +119,16 @@ object Constants {
             )
         )
     )
+
+    val COMPATIBILITY_PROTONVPN = Compatibility(
+        name = "Proton VPN",
+        packageName = "ch.protonvpn.android",
+        apkFileType = ApkFileType.APK,
+        appIconColor = 0x6D4AFF,
+        targets = listOf(
+            AppTarget(
+                version = "5.21.57.0"
+            )
+        )
+    )
 }
