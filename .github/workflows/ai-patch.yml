@@ -30,11 +30,6 @@ on:
         description: Issue number to process
         required: true
         type: number
-      debug_agent_output:
-        description: Stream sanitized Codex output to the Actions log
-        required: false
-        type: boolean
-        default: false
 
 concurrency:
   group: ai-patch
@@ -450,26 +445,29 @@ jobs:
           : > "$LOG"
           cp "${RUNNER_TEMP}/task.md" "$TASK_SNAPSHOT" 2>/dev/null || true
 
-          status=0
-          if [ "${DEBUG_AGENT_OUTPUT:-false}" = "true" ]; then
-            echo "::notice::Streaming sanitized Codex output because debug_agent_output is enabled."
-            codex exec \
-              --sandbox danger-full-access \
-              --skip-git-repo-check \
-              --model "${AI_MODEL}" \
-              --output-last-message "${RUNNER_TEMP}/agent-message.md" \
-              - < "${RUNNER_TEMP}/task.md" 2>&1 \
-              | tee "$LOG" \
-              | python3 -u "${GITHUB_WORKSPACE}/.github/scripts/stream_agent_log.py" "$TASK_SNAPSHOT"
-            status=${PIPESTATUS[0]}
-          else
-            codex exec \
-              --sandbox danger-full-access \
-              --skip-git-repo-check \
-              --model "${AI_MODEL}" \
-              --output-last-message "${RUNNER_TEMP}/agent-message.md" \
-              - < "${RUNNER_TEMP}/task.md" > "$LOG" 2>&1 || status=$?
-          fi
+          # Always stream. A step that prints nothing for an hour looks hung and gets
+          # cancelled, which is exactly what happened before: the transcript stayed in
+          # runner temp and the whole run was lost as a result. stream_agent_log.py drops
+          # every line that matches the private brief, and the heartbeat keeps the log
+          # alive while codex is thinking instead of printing.
+          start=$(date +%s)
+          (
+            while sleep 30; do
+              bytes=$(wc -c < "$LOG" 2>/dev/null || echo 0)
+              echo "::notice::agent still running: $(( $(date +%s) - start ))s elapsed, $(( bytes / 1024 )) KB of output"
+            done
+          ) &
+          heartbeat=$!
+          codex exec \
+            --sandbox danger-full-access \
+            --skip-git-repo-check \
+            --model "${AI_MODEL}" \
+            --output-last-message "${RUNNER_TEMP}/agent-message.md" \
+            - < "${RUNNER_TEMP}/task.md" 2>&1 \
+            | tee "$LOG" \
+            | python3 -u "${GITHUB_WORKSPACE}/.github/scripts/stream_agent_log.py" "$TASK_SNAPSHOT"
+          status=${PIPESTATUS[0]}
+          kill "$heartbeat" 2>/dev/null || true
 
           echo "Codex exited with status ${status}. Full output is in the runner temp directory."
           python3 - "$LOG" "$TASK_SNAPSHOT" <<'PY' || true
