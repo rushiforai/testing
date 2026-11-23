@@ -2,6 +2,7 @@
 """Helpers for the AI patch workflow.
 
 Subcommands:
+  gate             Decide whether this run may start: synced community requests need approval.
   prepare          Parse the triggering issue, provide the APK URL and paths, and write the task file.
   validate         Reject changes outside the allowed patch source tree.
   verify           Optionally apply the built patch bundle to the APK with Morphe CLI.
@@ -29,6 +30,11 @@ from pathlib import Path
 APP_FILE_TYPES = {".apk": "APK", ".apkm": "APKM", ".xapk": "XAPK", ".apks": "APKS"}
 PACKAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$")
 WORKED_RE = re.compile(r"^/?(worked|fixed|solved)[.!]*$")
+APPROVE_RE = re.compile(
+    r"^/?(?:approve|approved)\s*:?\s*(https?://\S+)?$",
+    re.IGNORECASE,
+)
+FEED_LABEL = "request-feed"
 ALLOWED_PREFIXES = (
     "patches/src/main/kotlin/",
     "patches/src/main/resources/",
@@ -149,7 +155,7 @@ def get_field(sections: dict[str, str], field: str) -> str:
     return ""
 
 
-def fetch_comments(issue_number: int) -> list[str]:
+def fetch_comment_objects(issue_number: int) -> list[dict]:
     comments: list[dict] = []
     for page in range(1, 6):
         try:
@@ -161,9 +167,12 @@ def fetch_comments(issue_number: int) -> list[str]:
         comments.extend(batch)
         if len(batch) < 100:
             break
+    return comments
 
+
+def fetch_comments(issue_number: int) -> list[str]:
     rendered = []
-    for comment in comments:
+    for comment in fetch_comment_objects(issue_number):
         body = (comment.get("body") or "").strip()
         if not body or "<!-- ai-patch-lock -->" in body:
             continue
@@ -438,6 +447,87 @@ def issue_from_event() -> tuple[dict, dict | None, str]:
     return event, issue, event_name
 
 
+def find_approval(number: int) -> dict | None:
+    """Return the newest maintainer `approve` comment, if there is one."""
+    for comment in reversed(fetch_comment_objects(number)):
+        user = comment.get("user") or {}
+        login = user.get("login", "")
+        if user.get("type") == "Bot" or login.endswith("[bot]"):
+            continue
+        if comment.get("author_association") not in {"OWNER", "MEMBER", "COLLABORATOR"}:
+            continue
+        body = (comment.get("body") or "").strip()
+        if not APPROVE_RE.match(body):
+            continue
+        match = re.search(r"https?://\S+", body)
+        return {
+            "id": comment.get("id"),
+            "login": login,
+            "url": match.group(0).rstrip(").,;") if match else "",
+        }
+    return None
+
+
+def persist_apk_url(issue: dict, url: str) -> None:
+    """Write an approval URL into the issue form so the request stays complete."""
+    body = issue.get("body") or ""
+    pattern = re.compile(r"(?ms)^###\s+App file download URL\s*$\n.*?(?=^###\s|\Z)")
+    replacement = f"### App file download URL\n\n{url}\n\n"
+    if pattern.search(body):
+        updated = pattern.sub(lambda _: replacement, body, count=1)
+    else:
+        updated = body.rstrip() + "\n\n" + replacement
+    if updated == body:
+        return
+    try:
+        result = gh(
+            "issue",
+            "edit",
+            str(issue["number"]),
+            "--body-file",
+            "-",
+            input_text=updated,
+            check=False,
+        )
+        if result.returncode != 0:
+            log(
+                f"::warning::Could not save the approved URL on issue "
+                f"#{issue['number']}: {result.stderr.strip()}"
+            )
+    except Exception as error:  # noqa: BLE001 - the run can continue without it
+        log(
+            f"::warning::Could not save the approved URL on issue "
+            f"#{issue['number']}: {error}"
+        )
+
+
+def cmd_gate() -> None:
+    """Skip the whole run for a community request until a maintainer approves it."""
+    _, issue, _ = issue_from_event()
+    labels = {label.get("name", "") for label in issue.get("labels") or []}
+    if FEED_LABEL not in labels:
+        write_output("run", "true")
+        log("Not a synced community request; no approval is required.")
+        return
+
+    approval = find_approval(int(issue["number"]))
+    if approval:
+        if approval.get("url"):
+            # Record the URL on the issue while this job still has issues: write. The agent
+            # job is read-only, and later runs then see a complete request in the body.
+            try:
+                current = gh_json(f"repos/{REPO}/issues/{issue['number']}")
+            except Exception as error:  # noqa: BLE001 - the run can continue without it
+                log(f"::warning::Could not re-read issue #{issue['number']}: {error}")
+                current = issue
+            persist_apk_url(current, approval["url"])
+        write_output("run", "true")
+        log(f"Community request approved by @{approval['login']}.")
+    else:
+        write_output("run", "false")
+        log("Community request is waiting for a maintainer `approve` comment; skipping the agent.")
+
+
 def cmd_prepare() -> None:
     event, issue, event_name = issue_from_event()
     number = int(issue["number"])
@@ -457,6 +547,25 @@ def cmd_prepare() -> None:
     apk_url = get_field(sections, "apk_url")
     requested_version = get_field(sections, "requested_version")
     request_text = get_field(sections, "request")
+
+    labels = {label.get("name", "") for label in issue.get("labels") or []}
+    is_feed_request = FEED_LABEL in labels
+    approval = find_approval(number) if is_feed_request else None
+    if is_feed_request and not approval:
+        skip("community request has not been approved by a maintainer")
+        return
+
+    if is_feed_request and approval and approval.get("url"):
+        # The gate job saves this URL on the issue, but the event payload for the approval
+        # comment predates that edit, so use the comment's URL for this run.
+        apk_url = approval["url"]
+
+    if is_feed_request and not apk_url:
+        fail_prepare(
+            "The request is approved, but it has no app file download URL. Add one under "
+            "`### App file download URL` in the issue body, or comment "
+            "`approve https://example.com/app.apk`."
+        )
 
     if not (app_name and requested_package and apk_url and request_text):
         skip("issue is not a complete patch request")
@@ -488,6 +597,9 @@ def cmd_prepare() -> None:
         normalized = re.sub(r"\s+", " ", body.lower())
         if WORKED_RE.fullmatch(normalized):
             mode = "close"
+        elif is_feed_request and APPROVE_RE.match(body):
+            # The approval is a gate, not feedback: its URL was already picked up above.
+            log("Approval comment received; no extra feedback for the agent.")
         else:
             if len(body) < 10:
                 skip("comment is too short to be actionable feedback")
@@ -1089,11 +1201,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=["prepare", "validate", "verify", "comment-success", "comment-failure", "close"],
+        choices=[
+            "gate",
+            "prepare",
+            "validate",
+            "verify",
+            "comment-success",
+            "comment-failure",
+            "close",
+        ],
     )
     args = parser.parse_args()
 
     commands = {
+        "gate": cmd_gate,
         "prepare": cmd_prepare,
         "validate": cmd_validate,
         "verify": cmd_verify,

@@ -1,0 +1,63 @@
+name: Sync community requests
+
+# Mirrors the Morphe community request board into GitHub issues labelled `request-feed`.
+# An issue created here is inert: the AI patch workflow only starts its agent after a
+# maintainer comments `approve` (optionally `approve <url>`) on that issue.
+#
+# GitHub only runs scheduled workflows that exist on the default branch, so the daily run
+# starts after this file reaches `main`. Until then it can be tested with `workflow_dispatch`
+# on `dev` once the file is also present on `main`.
+#
+# New requests come from the full board API; the RSS feed supplies update events (patch text,
+# last activity, link). A failed or malformed feed warns and falls back to the API, and a bad
+# API entry is skipped. At most REQUESTS_MAX_NEW issues are created per run (default 100,
+# 0 = no limit). The API keeps every request, so the rest wait for a later run.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print planned creates/updates without changing issues"
+        type: boolean
+        default: false
+      max_new:
+        description: "Maximum new issues this run (0 = no limit)"
+        type: string
+        default: "100"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: requests-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync requests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v7
+        with:
+          ref: dev
+          persist-credentials: false
+
+      - name: Mirror the request feed into issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          # The schedule uses the repository variable (or 100); a manual run can raise or
+          # lift the cap without editing the workflow.
+          REQUESTS_MAX_NEW: ${{ github.event.inputs.max_new || vars.REQUESTS_MAX_NEW || '100' }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          python3 .github/scripts/requests_sync.py "${args[@]}"

@@ -18,6 +18,10 @@ name: AI patch agent
 # This file must exist on the repository's default branch for `issues` / `issue_comment` events.
 # Runs are serialized: GitHub Actions keeps one run active and one pending, so a newer pending
 # run replaces an older pending one. The active issue is locked and unlocked by the first/last jobs.
+#
+# Issues synced from morphe-patches.software (label `request-feed`) do not start the agent on
+# creation. The `gate` job waits for a maintainer to comment `approve` (optionally
+# `approve <url>`), and only then does the rest of the pipeline run.
 
 on:
   issues:
@@ -36,9 +40,39 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Cheap pre-flight: a synced community request is inert until a maintainer comments
+  # `approve`. Doing this before checkout and toolchain setup means an unapproved request
+  # costs seconds, not a full job.
+  gate:
+    name: Check approval
+    if: vars.AI_PATCH_ENABLED != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      # The gate records an approval URL in the issue body; the agent job stays read-only.
+      issues: write
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    env:
+      ISSUE_NUMBER: ${{ github.event.issue.number || github.event.inputs.issue_number }}
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v7
+        with:
+          ref: dev
+          persist-credentials: false
+
+      - name: Check whether this run is approved
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/ai_patch.py gate
+
   lock:
     name: Lock issue
-    if: vars.AI_PATCH_ENABLED != 'false'
+    needs: gate
+    if: vars.AI_PATCH_ENABLED != 'false' && needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -92,8 +126,8 @@ jobs:
 
   agent:
     name: Generate patch
-    needs: lock
-    if: vars.AI_PATCH_ENABLED != 'false'
+    needs: [gate, lock]
+    if: vars.AI_PATCH_ENABLED != 'false' && needs.gate.outputs.run == 'true'
     outputs:
       mode: ${{ steps.prepare.outputs.mode }}
     runs-on: ubuntu-latest
