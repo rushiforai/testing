@@ -143,4 +143,16 @@ object Constants {
             )
         )
     )
+
+    val COMPATIBILITY_MIMO = Compatibility(
+        name = "Mimo: Learn Python Coding & AI",
+        packageName = "com.getmimo",
+        apkFileType = ApkFileType.APKM,
+        appIconColor = 0x191B33,
+        targets = listOf(
+            AppTarget(
+                version = "9.39"
+            )
+        )
+    )
 }
