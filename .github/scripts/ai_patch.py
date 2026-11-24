@@ -43,7 +43,6 @@ ALLOWED_APK_SOURCES = (
     "Uptodown",
     "APKPure",
     "APKCube",
-    "APKCombo",
 )
 FEED_LABEL = "request-feed"
 ALLOWED_PREFIXES = (
@@ -817,8 +816,9 @@ moment", use FlareSolverr as the network rules describe. If no allowed source
 serves this package, stop with that blocker; never fall back to another site."""
 
     sources_text = (
-        "GitHub releases of the app's own repository when the app is open source,\n"
-        "APKMirror, Uptodown, APKPure, APKCube and APKCombo"
+        "the app's original GitHub repository when it is open source (a release\n"
+        "asset from that repository only, never a fork, mirror or reupload),\n"
+        "APKMirror, Uptodown, APKPure and APKCube"
     )
     apk_section = f"""## APK download and workspace (your responsibility)
 
@@ -826,8 +826,8 @@ serves this package, stop with that blocker; never fall back to another site."""
 
 Allowed app-file sources: {sources_text}. Nothing else qualifies: no APKMody,
 APKSum, ModAPK, Telegram or file-share reupload sites, and no build marked MOD,
-patched, premium unlocked or re-signed. Prefer the app's own GitHub release asset
-when its source is public.
+patched, premium unlocked or re-signed. Prefer the original GitHub release asset
+when the app's source is public.
 
 Detect APK/APKM/XAPK/APKS. For a bundle, keep the original at `{apk_path}` and
 extract the base APK to `{base_apk_path}`.

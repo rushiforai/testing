@@ -629,8 +629,8 @@ jobs:
           - If FlareSolverr is unset or fails, fall back to `curl_cffi` with
             `impersonate="chrome"`, then `cloudscraper`, then Playwright on system Chrome.
             Report a blocked mirror instead of guessing at paid or third-party download links.
-          - App files come only from APKMirror, Uptodown, APKPure, APKCube, APKCombo, or the
-            app's own GitHub releases when it is open source. Any other host is a hard
+          - App files come only from APKMirror, Uptodown, APKPure, APKCube, or the app's
+            original GitHub repository when it is open source. Any other host is a hard
             stop: never download from it and never patch a build you got elsewhere.
           EOF
 
