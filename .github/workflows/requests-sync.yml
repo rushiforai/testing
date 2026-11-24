@@ -9,8 +9,8 @@ name: Sync community requests
 #
 # New requests come from the full board API; the RSS feed supplies update events (patch text,
 # last activity, link). A failed or malformed feed warns and falls back to the API, and a bad
-# API entry is skipped. At most REQUESTS_MAX_NEW issues are created per run (default 100,
-# 0 = no limit). The API keeps every request, so the rest wait for a later run.
+# API entry is skipped. Nothing is capped: every untracked request becomes an issue in one
+# run, so a first sync creates the whole backlog.
 #
 # The board reports `exists` once a patch for that app exists; the sync closes the matching
 # issue with a comment instead of leaving it open for someone to approve. Issues the agent
@@ -25,10 +25,6 @@ on:
         description: "Print planned creates/updates without changing issues"
         type: boolean
         default: false
-      max_new:
-        description: "Maximum new issues this run (0 = no limit)"
-        type: string
-        default: "100"
       close_exists:
         description: "Close tracked issues the board already lists as having a patch"
         type: boolean
@@ -46,7 +42,8 @@ jobs:
   sync:
     name: Sync requests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Uncapped: a cold sync can create the whole backlog, about 1.2s per issue.
+    timeout-minutes: 60
     steps:
       - name: Checkout dev
         uses: actions/checkout@v7
@@ -58,9 +55,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          # The schedule uses the repository variable (or 100); a manual run can raise or
-          # lift the cap without editing the workflow.
-          REQUESTS_MAX_NEW: ${{ github.event.inputs.max_new || vars.REQUESTS_MAX_NEW || '100' }}
         run: |
           set -euo pipefail
           args=()

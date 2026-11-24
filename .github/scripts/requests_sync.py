@@ -15,12 +15,13 @@ continues from the API, and a malformed API entry is skipped instead of failing 
 An issue created here is inert: `.github/workflows/ai-patch.yml` only starts the
 patch agent after a maintainer comments `approve` (optionally `approve <url>`).
 
-At most `--max-new` issues are created per run (default 100, 0 = no limit). The API
-keeps every request, so requests over the cap are picked up by a later run.
+Nothing is capped: every untracked request becomes an issue in the same run, so the first
+sync creates the whole backlog. The API keeps every request, so anything missed is picked
+up by the next run.
 
 Usage:
   python3 .github/scripts/requests_sync.py [--dry-run] [--feed URL]
-      [--existing-file PATH] [--max-new N] [--no-api]
+      [--existing-file PATH] [--no-api] [--close-exists]
 """
 
 from __future__ import annotations
@@ -541,25 +542,7 @@ def main() -> None:
         action="store_true",
         help="Close tracked issues the board reports as already having a patch (status=exists).",
     )
-    parser.add_argument(
-        "--max-new",
-        type=int,
-        default=None,
-        help=(
-            "Maximum new issues per run; 0 means no limit "
-            "(default: REQUESTS_MAX_NEW or 100)."
-        ),
-    )
     args = parser.parse_args()
-
-    max_new = args.max_new
-    if max_new is None:
-        try:
-            max_new = int(os.environ.get("REQUESTS_MAX_NEW", "100"))
-        except ValueError:
-            max_new = 100
-    if max_new < 0:
-        max_new = 100
 
     feed: dict[str, dict] = {}
     for event in load_feed(args.feed):
@@ -669,12 +652,6 @@ def main() -> None:
         reverse=True,
     )
     new_items = untracked_feed + untracked_api
-    if max_new and len(new_items) > max_new:
-        log(
-            f"Creating {max_new} of {len(new_items)} untracked requests this run; "
-            "the rest are picked up next run."
-        )
-        new_items = new_items[:max_new]
 
     for item in new_items:
         log(
