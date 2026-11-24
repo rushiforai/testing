@@ -456,6 +456,25 @@ jobs:
           TAR="${RUNNER_TEMP}/flaresolverr.tar.gz"
           LOG="${RUNNER_TEMP}/flaresolverr.log"
 
+          # The bundle ships its own Chromium, but the runner image is missing a few
+          # shared libraries it links against. Without them Chrome dies at startup
+          # ("error while loading shared libraries: libwayland-server.so.0") and every
+          # mirror stays behind Cloudflare, as in run 45306413889.
+          CHROME_LIBS="libwayland-server0 libgbm1 libxkbcommon0 libxdamage1 \
+            libxcomposite1 libxrandr2 libnss3 libnspr4 libcairo2 libpango-1.0-0 \
+            libcups2t64 libasound2t64 libatk-bridge2.0-0t64 libatspi2.0-0t64"
+          sudo apt-get update -qq >/dev/null 2>&1 || true
+          # Word splitting is intended here: CHROME_LIBS is a package list.
+          # shellcheck disable=SC2086
+          if ! sudo apt-get install -y -qq --no-install-recommends $CHROME_LIBS \
+              >/dev/null 2>&1; then
+            # One renamed package must not cost the whole set: install what exists.
+            for lib in $CHROME_LIBS; do
+              sudo apt-get install -y -qq --no-install-recommends "$lib" \
+                >/dev/null 2>&1 || true
+            done
+          fi
+
           if ! curl -fsSL --retry 3 -o "$TAR" \
               "https://github.com/FlareSolverr/FlareSolverr/releases/download/v${VERSION}/flaresolverr_linux_x64.tar.gz"; then
             echo "::warning::FlareSolverr download failed; falling back to cloudscraper/curl_cffi"
@@ -489,6 +508,11 @@ jobs:
           done
           if [ "$ready" -ne 1 ]; then
             echo "::warning::FlareSolverr did not start; falling back to cloudscraper/curl_cffi"
+            # Name the missing shared libraries instead of leaving it to the next run.
+            CHROME_BIN=$(find "$DIR" -maxdepth 4 -type f -name chrome | head -n1)
+            if [ -n "${CHROME_BIN:-}" ]; then
+              ldd "$CHROME_BIN" 2>/dev/null | grep "not found" || true
+            fi
             tail -n 20 "$LOG" 2>/dev/null || true
             exit 0
           fi
@@ -692,6 +716,10 @@ jobs:
           STALL_LIMIT="${AGENT_STALL_LIMIT:-900}"
           FIRST_TOOL_LIMIT="${AGENT_FIRST_TOOL_LIMIT:-900}"
           WATCH_INTERVAL="${AGENT_WATCH_INTERVAL:-30}"
+          # Run 45306413889 analysed for 35 minutes, never wrote a file, and ended its
+          # turn. A run that has not touched the repo by this point is drifting: kill it
+          # so repair starts from a fresh context instead of the model idling on.
+          EDIT_DEADLINE="${AGENT_EDIT_DEADLINE:-1800}"
           : > "$STREAM"
 
           start=$(date +%s)
@@ -714,12 +742,18 @@ jobs:
           stalled=""
           last=-1
           stall=0
+          edits=0
           while kill -0 "$codex_pid" 2>/dev/null; do
             sleep "$WATCH_INTERVAL"
             size=$(wc -c < "$LOG" 2>/dev/null || echo 0)
             if [ "$size" -eq "$last" ]; then stall=$((stall + WATCH_INTERVAL)); else stall=0; last=$size; fi
             if grep -qE '^(exec|apply_patch)$' "$LOG" 2>/dev/null; then acted=1; fi
-            echo "::notice::agent running: $(( $(date +%s) - start ))s elapsed, $(( size / 1024 )) KB output, ${stall}s stale, tool calls: $([ "$acted" -eq 1 ] && echo yes || echo no)"
+            edits=$(git status --porcelain -uall 2>/dev/null | wc -l)
+            echo "::notice::agent running: $(( $(date +%s) - start ))s elapsed, $(( size / 1024 )) KB output, ${stall}s stale, tool calls: $([ "$acted" -eq 1 ] && echo yes || echo no), ${edits} changed paths"
+            if [ "$edits" -eq 0 ] && [ $(( $(date +%s) - start )) -ge "$EDIT_DEADLINE" ]; then
+              stalled="no file changes in ${EDIT_DEADLINE}s"
+              break
+            fi
             if [ "$stall" -ge "$STALL_LIMIT" ]; then
               stalled="no new output for ${stall}s"
               break
@@ -917,6 +951,7 @@ jobs:
           APK_URL: ${{ steps.prepare.outputs.apk_url }}
           APK_PATH: ${{ steps.prepare.outputs.apk_path }}
           BASE_APK_PATH: ${{ steps.prepare.outputs.base_apk_path }}
+          DECOMPILED_DIR: ${{ runner.temp }}/decompiled
           AGENT_BRIEF_DIR: ${{ runner.temp }}/brief
           INITIAL_AGENT_OUTCOME: ${{ steps.agent.outcome }}
           INITIAL_VALIDATE_OUTCOME: ${{ steps.validate_changes.outcome }}
@@ -963,6 +998,16 @@ jobs:
               fi
             fi
             echo "Automatic repair attempt ${attempt} after ${INITIAL_STAGE} failed."
+            # A repair is only cheap when it continues the first attempt. Tell it exactly
+            # what that attempt left on disk, and drop the "fix the existing changes" line
+            # when there are none: run 45306413889 got that text after a run that edited
+            # nothing, so attempt 1 re-read the whole task from scratch.
+            CHANGES=$(git status --porcelain -uall 2>/dev/null | wc -l)
+            NOTES_DIR="${RUNNER_TEMP}/notes"
+            AGENT_MSG="${RUNNER_TEMP}/agent-message.md"
+            DECOMPILED="${DECOMPILED_DIR:-${RUNNER_TEMP}/decompiled}"
+            APP_FILE="${APK_PATH:-${RUNNER_TEMP}/input/app.apk}"
+            BASE_FILE="${BASE_APK_PATH:-${RUNNER_TEMP}/input/base.apk}"
             cp "${RUNNER_TEMP}/task.md" "${RUNNER_TEMP}/repair-task.md"
             {
               echo ""
@@ -970,13 +1015,31 @@ jobs:
               echo ""
               echo "Nobody can answer questions during this run. Do not ask for confirmation,"
               echo "do not ask \"should I proceed?\", and do not wait for a user reply."
-              echo "The previous attempt failed at ${INITIAL_STAGE}. Fix the existing changes"
-              echo "in the working tree, rebuild, and re-apply the patch with Morphe CLI. Retry"
-              echo "on your own until it applies cleanly or you have a concrete blocker."
-              echo "If the APK is missing at ${APK_PATH:-${RUNNER_TEMP}/input/app.apk}, download it"
-              echo "from ${APK_URL:-the issue URL} and extract the base APK to"
-              echo "${BASE_APK_PATH:-${RUNNER_TEMP}/input/base.apk} before rebuilding."
+              if [ "${CHANGES:-0}" -gt 0 ]; then
+                echo "The previous attempt failed at ${INITIAL_STAGE}. Fix the existing changes"
+                echo "in the working tree, rebuild, and re-apply the patch with Morphe CLI."
+              else
+                echo "The previous attempt failed at ${INITIAL_STAGE} and left no file changes."
+                echo "Do not repeat its research. Everything it produced is still on disk:"
+                echo ""
+                echo "- app file: ${APP_FILE}"
+                echo "- base APK: ${BASE_FILE}"
+                echo "- decompiled tree: ${DECOMPILED}"
+                echo "- analysis notes: ${NOTES_DIR}"
+                echo ""
+                echo "Write the patch sources first, then build and apply. A partial patch"
+                echo "that compiles is worth more than another round of analysis."
+              fi
+              echo "Do not download the app file again and do not decompile it again;"
+              echo "both are already done. Retry on your own until it applies cleanly or"
+              echo "you hit a concrete blocker."
               echo ""
+              if [ -s "$AGENT_MSG" ]; then
+                echo "### What the previous attempt concluded"
+                echo ""
+                tail -c 3000 "$AGENT_MSG" || true
+                echo ""
+              fi
               if [ -n "${INITIAL_LOG}" ] && [ -f "${INITIAL_LOG}" ]; then
                 echo "### Failure output"
                 echo ""

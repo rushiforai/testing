@@ -886,6 +886,16 @@ read that index now, then open a reference file only when your current step need
 
 {request_text}
 
+## Budget
+
+This run has one job: a patch that builds and applies. Spend no more than 15
+minutes reading the decompiled tree before you write the first patch file, then
+iterate on the build. Keep every tool's output small (`rg -n -m 20`, `sed -n`,
+`wc -l`, `head -c 4000`); never `cat` a smali or Java file, print a whole dex
+listing, or dump a full log. A run that fills its context with decompiler output
+ends with no patch at all (run 45306413889 spent 35 minutes analysing and wrote
+nothing).
+
 """
 
     if feedback:
