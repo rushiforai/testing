@@ -183,8 +183,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Preparation only parses the issue and provides the URL/paths. The agent downloads,
-      # resolves landing pages, validates the size/type, and extracts the base APK.
+      # Preparation only parses the issue and provides the URL/paths when the issue has
+      # them. The agent finds a missing URL, resolves landing pages, downloads, validates
+      # the size/type, and extracts the base APK.
       - name: Prepare issue and APK
         id: prepare
         env:
@@ -628,6 +629,9 @@ jobs:
           - If FlareSolverr is unset or fails, fall back to `curl_cffi` with
             `impersonate="chrome"`, then `cloudscraper`, then Playwright on system Chrome.
             Report a blocked mirror instead of guessing at paid or third-party download links.
+          - App files come only from APKMirror, Uptodown, APKPure, APKCube, APKCombo, or the
+            app's own GitHub releases when it is open source. Any other host is a hard
+            stop: never download from it and never patch a build you got elsewhere.
           EOF
 
           # CI autonomy override. The brief is already in task.md; no separate AGENTS.md is created.

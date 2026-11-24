@@ -283,11 +283,13 @@ _No response_
 
 ### Approval
 
-Add the app file URL above, then comment:
+Comment:
 
     approve
 
-Or supply the URL in the same comment:
+The URL above is optional: without it the agent searches GitHub releases and the
+allowed APK mirrors for this package itself. To pin a specific file, put it above or
+comment:
 
     approve https://example.com/app.apk
 """

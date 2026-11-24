@@ -34,6 +34,17 @@ APPROVE_RE = re.compile(
     r"^/?(?:approve|approved)\s*:?\s*(https?://\S+)?$",
     re.IGNORECASE,
 )
+
+# App files may only come from these mirrors, or from a GitHub release of the
+# app's own repository when the app is open source. The agent is told the same
+# list in its task and in the workflow network rules.
+ALLOWED_APK_SOURCES = (
+    "APKMirror",
+    "Uptodown",
+    "APKPure",
+    "APKCube",
+    "APKCombo",
+)
 FEED_LABEL = "request-feed"
 ALLOWED_PREFIXES = (
     "patches/src/main/kotlin/",
@@ -633,14 +644,17 @@ def cmd_prepare() -> None:
         # comment predates that edit, so use the comment's URL for this run.
         apk_url = approval["url"]
 
-    if is_feed_request and not apk_url:
-        fail_prepare(
-            "The request is approved, but it has no app file download URL. Add one under "
-            "`### App file download URL` in the issue body, or comment "
-            "`approve https://example.com/app.apk`."
-        )
+    # A synced community request usually has no URL: the agent finds the app file
+    # itself from an allowed mirror. Only a manual patch issue is still incomplete
+    # without one.
+    if not apk_url:
+        if is_feed_request:
+            log("No app file URL on the issue; the agent will find one from an allowed source.")
+        else:
+            skip("issue is not a complete patch request")
+            return
 
-    if not (app_name and requested_package and apk_url and request_text):
+    if not (app_name and requested_package and request_text):
         skip("issue is not a complete patch request")
         return
 
@@ -704,20 +718,21 @@ def cmd_prepare() -> None:
         fail_prepare(f"`{requested_package}` is not a valid Android package name")
 
     apk_url = apk_url.strip()
-    if not re.match(r"https?://", apk_url, re.IGNORECASE):
-        fail_prepare("The app file URL must start with http:// or https://")
+    if apk_url:
+        if not re.match(r"https?://", apk_url, re.IGNORECASE):
+            fail_prepare("The app file URL must start with http:// or https://")
 
-    if any(char.isspace() for char in apk_url):
-        fail_prepare(
-            "Provide exactly one direct download URL, with no spaces, notes or extra links."
-        )
+        if any(char.isspace() for char in apk_url):
+            fail_prepare(
+                "Provide exactly one direct download URL, with no spaces, notes or extra links."
+            )
 
-    try:
-        parsed_url = urllib.parse.urlsplit(apk_url)
-    except ValueError:
-        parsed_url = None
-    if parsed_url is None or not parsed_url.netloc:
-        fail_prepare("The app file URL is not a valid http(s) URL.")
+        try:
+            parsed_url = urllib.parse.urlsplit(apk_url)
+        except ValueError:
+            parsed_url = None
+        if parsed_url is None or not parsed_url.netloc:
+            fail_prepare("The app file URL is not a valid http(s) URL.")
 
     write_output("app_name", app_name)
     write_output("package_name", requested_package)
@@ -774,16 +789,46 @@ def cmd_prepare() -> None:
             f"`{reference_matches}`. Read at least two of them before writing patch code."
         )
 
-    apk_section = f"""## APK download and workspace (your responsibility)
-
-- URL: `{apk_url}`
+    decompiled_dir = TMP / "decompiled"
+    if apk_url:
+        apk_source = f"""- URL: `{apk_url}`
 - Download destination: `{apk_path}`
 - Base APK destination: `{base_apk_path}`
-- Decompiled tree: `{TMP / 'decompiled'}` — create it once, then reuse it for everything
+- Decompiled tree: `{decompiled_dir}` — create it once, then reuse it for everything
 
 The workflow does not download the app file. Download and validate it yourself.
 The URL may be a file-host landing page; resolve the actual file link (for
 tmpfiles.org, follow the page's signed "Download" link). Require a valid ZIP/APK.
+If that URL is dead, blocked, or serves something other than the app, take the
+file from an allowed source below instead."""
+    else:
+        apk_source = f"""- No app file URL on the issue: find one.
+- Download destination: `{apk_path}`
+- Base APK destination: `{base_apk_path}`
+- Decompiled tree: `{decompiled_dir}` — create it once, then reuse it for everything
+
+The workflow does not download the app file. Find it, download it and validate it:
+require a valid ZIP/APK. Search the package name exactly (`{requested_package}`); a
+same-named app from another developer is a mismatch, not a build to try. Take the
+newest stable version, or the version the issue names. APKMirror hides the file
+behind a version page: open it, follow "Download APK", then the signed link on the
+next page. Every mirror sits behind Cloudflare; when it answers with "Just a
+moment", use FlareSolverr as the network rules describe. If no allowed source
+serves this package, stop with that blocker; never fall back to another site."""
+
+    sources_text = (
+        "GitHub releases of the app's own repository when the app is open source,\n"
+        "APKMirror, Uptodown, APKPure, APKCube and APKCombo"
+    )
+    apk_section = f"""## APK download and workspace (your responsibility)
+
+{apk_source}
+
+Allowed app-file sources: {sources_text}. Nothing else qualifies: no APKMody,
+APKSum, ModAPK, Telegram or file-share reupload sites, and no build marked MOD,
+patched, premium unlocked or re-signed. Prefer the app's own GitHub release asset
+when its source is public.
+
 Detect APK/APKM/XAPK/APKS. For a bundle, keep the original at `{apk_path}` and
 extract the base APK to `{base_apk_path}`.
 
@@ -797,7 +842,7 @@ directory: a repeat decompile costs a minute and tells you nothing the first one
 
 Verify that the base APK package is `{requested_package}`. If it is different,
 stop with a clear mismatch. Before finishing, update `{TMP / 'issue.json'}` with
-the detected `package_name`, `apk_version`, and `file_type`.
+the detected `package_name`, `apk_version`, `file_type` and the `apk_url` you used.
 """
 
     task = f"""## Brief library (read the index once)
