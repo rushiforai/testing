@@ -49,6 +49,24 @@ ISSUE_JSON = TMP / "issue.json"
 TASK_FILE = TMP / "task.md"
 PREPARE_ERROR = TMP / "prepare-error.txt"
 VERIFY_STATUS = TMP / "verify-status"
+BRIEF_DIR = TMP / "brief"
+PRIVATE_SCAN = TMP / "private-scan.md"
+
+# The brief is resent with every model turn, so only rules that must always apply stay in
+# the prompt. Everything here is lookup material: it moves to BRIEF_DIR and is read on
+# demand. Headings are matched lowercased; anything unmatched stays in the prompt, so a
+# brief edit can only add prompt text, never silently drop a rule.
+BRIEF_REFERENCE_SECTIONS = {
+    "repository map",
+    "common patch patterns",
+    "billing, ads, and protections",
+    "framework notes",
+    "smali quick reference",
+    "obfuscation guide",
+    "debugging fingerprints",
+    "tools",
+    "references",
+}
 
 REPO = os.environ.get("GITHUB_REPOSITORY", "")
 SERVER = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
@@ -430,6 +448,61 @@ def load_agent_brief() -> str:
     return ""
 
 
+def write_brief_library(brief: str) -> str:
+    """Write the reference half of the brief to BRIEF_DIR and return the prompt half."""
+    parts = re.split(r"(?m)^(?=## )", brief)
+    inline_parts: list[str] = []
+    reference: list[tuple[str, str]] = []
+    for part in parts:
+        lines = part.splitlines()
+        heading = lines[0][3:].strip().lower() if lines and lines[0].startswith("## ") else ""
+        if heading in BRIEF_REFERENCE_SECTIONS:
+            reference.append((heading, part.rstrip() + "\n"))
+        else:
+            inline_parts.append(part)
+
+    BRIEF_DIR.mkdir(parents=True, exist_ok=True)
+    index = [
+        "# Brief reference library",
+        "",
+        "Reference material only; the rules are already in the task prompt. These files sit",
+        "next to this index. Open one when your current step needs it, and grep instead of",
+        "printing it whole: whatever you print stays in the transcript and is resent on every",
+        "later turn.",
+        "",
+    ]
+    for number, (heading, text) in enumerate(reference, 1):
+        slug = re.sub(r"[^a-z0-9]+", "-", heading).strip("-")
+        path = BRIEF_DIR / f"{number:02d}-{slug}.md"
+        path.write_text(text, encoding="utf-8")
+        # A prose line, not a '###' subheading: the index has to say what the file is for.
+        summary = next(
+            (
+                line.strip()
+                for line in text.splitlines()[1:]
+                if line.strip() and not line.lstrip().startswith("#") and len(line.strip()) > 25
+            ),
+            "",
+        )
+        index.append(f"- `{path.name}` - {heading}: {summary[:100]}")
+    (BRIEF_DIR / "INDEX.md").write_text("\n".join(index) + "\n", encoding="utf-8")
+
+    # The log sanitizer locates private text by these markers; the prompt no longer carries
+    # the whole brief, so it reads this file instead.
+    PRIVATE_SCAN.write_text(
+        f"<!-- agent-brief:start -->\n{brief}\n<!-- agent-brief:end -->\n",
+        encoding="utf-8",
+    )
+
+    inline = "".join(inline_parts).strip()
+    moved_chars = sum(len(text) for _, text in reference)
+    log(
+        f"Brief split: prompt {len(inline)} chars, {len(reference)} reference files "
+        f"({moved_chars} chars) in {BRIEF_DIR}"
+    )
+    return inline
+
+
 def issue_from_event() -> tuple[dict, dict | None, str]:
     event_name = os.environ.get("GITHUB_EVENT_NAME", "")
     event_path = os.environ.get("GITHUB_EVENT_PATH")
@@ -685,7 +758,7 @@ def cmd_prepare() -> None:
     }
     ISSUE_JSON.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    brief = load_agent_brief()
+    inline_brief = write_brief_library(load_agent_brief())
     comments = fetch_comments(number)
     comments_text = "\n\n".join(comments) if comments else "No comments yet."
 
@@ -727,9 +800,13 @@ stop with a clear mismatch. Before finishing, update `{TMP / 'issue.json'}` with
 the detected `package_name`, `apk_version`, and `file_type`.
 """
 
-    task = f"""<!-- agent-brief:start -->
-{brief}
-<!-- agent-brief:end -->
+    task = f"""## Brief library (read the index once)
+
+Your full run brief is on disk at `{BRIEF_DIR}`. The rules below always apply. The
+reference sections are separate files listed one line each in `{BRIEF_DIR / 'INDEX.md'}`:
+read that index now, then open a reference file only when your current step needs it.
+
+{inline_brief}
 
 ---
 
@@ -782,7 +859,7 @@ request needs a different approach.
 
 - The repository is checked out on the `dev` branch with no commits from you.
 - Do not run git commands that change state; the workflow commits and pushes.
-- Do not read or copy private agent instructions into the repository.
+- The files under `$AGENT_BRIEF_DIR` are private: never copy them or their contents into the repository.
 - Do not copy the reference example patches into the repository; only adapt patterns you need.
 - There is no human in the loop: never ask a question, request confirmation, or wait for a reply.
 - Download the app file yourself from `$APK_URL` to `$APK_PATH` and extract `$BASE_APK_PATH`; the workflow does not download it.

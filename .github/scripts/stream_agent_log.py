@@ -29,11 +29,11 @@ def load_private(task_path: str) -> str:
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: stream_agent_log.py TASK_FILE", file=sys.stderr)
+    if len(sys.argv) < 2:
+        print("usage: stream_agent_log.py TASK_FILE [TASK_FILE...]", file=sys.stderr)
         return 2
 
-    private = load_private(sys.argv[1])
+    private = "\n".join(filter(None, (load_private(path) for path in sys.argv[1:])))
     private_lines = {
         normalize(line)
         for line in private.splitlines()

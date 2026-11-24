@@ -3,8 +3,9 @@ name: AI patch agent
 # Turns a "App patch request" issue into a Morphe patch, pushes it to `dev`, and replies on the
 # issue. Comment `worked` on the issue to close it, or comment more details to retry.
 #
-# The full agent brief is supplied only through the AGENT_BRIEF repository secret and is
-# written to a runner-temporary prompt for the run, never into the repository.
+# The agent brief is supplied only through the AGENT_BRIEF repository secret. Its rules half
+# goes into the runner-temporary prompt; its reference half is written to $RUNNER_TEMP/brief
+# and read on demand, so it is not resent with every model turn. Neither enters the repository.
 # Reference patches are a sparse checkout of morphe-archive/examplepatches at $EXAMPLE_PATCHES_DIR.
 #
 # Secrets:
@@ -388,21 +389,120 @@ jobs:
           "${VENV}/bin/pip" install --upgrade pip >/dev/null
 
           # Pillow and lxml are hard requirements: the analysis tools import them, and the
-          # agent needs Pillow to read the app icon colour. Wheels only, so pip never falls
-          # back to a source build on the runner.
-          "${VENV}/bin/pip" install --no-cache-dir --only-binary=:all: pillow lxml
+          # agent needs Pillow to read the app icon colour. Install the exact versions apknife
+          # pins, wheels only, so pip never falls back to a source build on the runner. Both
+          # pins ship cp312 manylinux wheels; their source builds fail against the runner GCC
+          # (run 44964583951: "Failed building wheel for lxml" / "for Pillow").
+          "${VENV}/bin/pip" install --no-cache-dir --only-binary=:all: \
+            "lxml==5.3.1" "Pillow==11.1.0"
 
+          # --only-binary applies to every package in the command, so the plain tools get
+          # their own call: distinguishing the solver here would also forbid their
+          # sdist-only transitive dependencies.
           "${VENV}/bin/pip" install --no-cache-dir \
             androguard apkid capstone pyelftools requests
-          # apknife pins its own Pillow/lxml; those pins also ship cp312 wheels.
+
+          # apkutils2 publishes no wheel; it is pure Python, so its sdist build is safe.
+          "${VENV}/bin/pip" install --no-cache-dir apkutils2
+
+          # No `|| echo` fallback: swallowing this failure left the agent with a reduced
+          # toolchain and a green step, which is how apknife, hbctool and droidlysis went
+          # missing in 7 of 22 runs. If it breaks, the step and the job fail.
           "${VENV}/bin/pip" install --no-cache-dir \
-            hermes-dec apksigcopier apkutils2 apksigtool droidlysis apknife hbctool \
-            || echo "::warning::Some optional Python analysis tools failed to install"
+            hermes-dec apksigcopier apksigtool droidlysis apknife hbctool
+
+          # Download helpers the agent used to install for itself mid-run (45071051087:
+          # cloudscraper, playwright, curl_cffi). Having them up front keeps a patch run from
+          # depending on network installs while it works. Playwright drives the image's Chrome
+          # through executable_path, so no bundled browser download is needed.
+          "${VENV}/bin/pip" install --no-cache-dir \
+            cloudscraper curl_cffi playwright
+
+          # Assert every tool is really present, so a partial install cannot pass unnoticed.
+          # pip show is name-based, so it covers packages whose module name differs.
+          missing=""
+          for pkg in androguard apkid capstone pyelftools requests lxml Pillow \
+                     apkutils2 hermes-dec apksigcopier apksigtool droidlysis apknife hbctool \
+                     cloudscraper curl_cffi playwright; do
+            "${VENV}/bin/pip" show "$pkg" >/dev/null 2>&1 || missing="${missing} ${pkg}"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Python analysis tools missing after install:${missing}"
+            exit 1
+          fi
 
           # Fail setup here, not five minutes into the agent, if the venv lost either module.
           "${VENV}/bin/python" -c \
             "import PIL, lxml.etree; print('Pillow', PIL.__version__, 'lxml', lxml.etree.__version__)"
           echo "${VENV}/bin" >> "$GITHUB_PATH"
+
+      # FlareSolverr drives a real, patched Chromium through Cloudflare's "Just a moment..."
+      # interstitial, which answered 403 to every plain HTTP client in run 45071051087:
+      # cloudscraper, curl_cffi (chrome110/120/124, safari17) and headless Playwright all got
+      # the challenge page from apkpure, apkcombo, apkfab, apkpure.net, apkgk and apktoy.
+      # Best effort on purpose: patch generation does not depend on it, so a mirror that blocks
+      # the service must not fail an otherwise good run.
+      - name: Start FlareSolverr
+        id: flaresolverr
+        if: steps.prepare.outputs.mode == 'run'
+        timeout-minutes: 5
+        run: |
+          set -uo pipefail
+
+          # Pinned: the Linux release is a self-contained PyInstaller bundle with its own Chromium.
+          VERSION=3.5.2
+          DIR="${RUNNER_TEMP}/flaresolverr"
+          TAR="${RUNNER_TEMP}/flaresolverr.tar.gz"
+          LOG="${RUNNER_TEMP}/flaresolverr.log"
+
+          if ! curl -fsSL --retry 3 -o "$TAR" \
+              "https://github.com/FlareSolverr/FlareSolverr/releases/download/v${VERSION}/flaresolverr_linux_x64.tar.gz"; then
+            echo "::warning::FlareSolverr download failed; falling back to cloudscraper/curl_cffi"
+            exit 0
+          fi
+
+          mkdir -p "$DIR"
+          if ! tar -xzf "$TAR" -C "$DIR"; then
+            echo "::warning::FlareSolverr archive could not be extracted; falling back"
+            exit 0
+          fi
+          BIN=$(find "$DIR" -maxdepth 2 -type f -name 'flaresolverr*' -perm -u+x | head -n1)
+          if [ -z "${BIN:-}" ]; then
+            echo "::warning::FlareSolverr binary not found in the archive; falling back"
+            exit 0
+          fi
+          chmod +x "$BIN"
+
+          ( cd "$DIR" && HEADLESS=true LOG_LEVEL=info "$BIN" >"$LOG" 2>&1 ) &
+          echo "$!" > "${RUNNER_TEMP}/flaresolverr.pid"
+
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl -fsS --max-time 2 -X POST http://127.0.0.1:8191/v1 \
+                 -H 'Content-Type: application/json' \
+                 -d '{"cmd":"sessions.list"}' >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "::warning::FlareSolverr did not start; falling back to cloudscraper/curl_cffi"
+            tail -n 20 "$LOG" 2>/dev/null || true
+            exit 0
+          fi
+
+          # Prove it renders a page, not merely answers HTTP, before advertising it to the agent.
+          smoke=$(curl -sS --max-time 90 -X POST http://127.0.0.1:8191/v1 \
+            -H 'Content-Type: application/json' \
+            -d '{"cmd":"request.get","url":"https://example.com","maxTimeout":60000}')
+          if printf '%s' "$smoke" | grep -q '"status": *200'; then
+            echo "FLARESOLVERR_URL=http://127.0.0.1:8191" >> "$GITHUB_ENV"
+            echo "FlareSolverr ready and serving pages"
+          else
+            echo "::warning::FlareSolverr answered but could not fetch a test page; falling back"
+            printf '%s' "$smoke" | head -c 600 || true
+          fi
 
       - name: Install Codex CLI
         if: steps.prepare.outputs.mode == 'run'
@@ -497,6 +597,39 @@ jobs:
             Co-authored-by: Claude <claude@anthropic.com>
           EOF
 
+          # Quoted heredoc: $FLARESOLVERR_URL must reach the agent as a variable to read at run
+          # time, not be expanded (and emptied) while the prompt is written.
+          cat >> "${RUNNER_TEMP}/task.md" <<'EOF'
+
+          ## Network access in CI
+
+          - Never install packages at runtime; this wins over older brief text that permits it.
+            `cloudscraper`, `curl_cffi` and `playwright` are already in the venv, and so are the
+            analysis tools. Chrome and Chromium are at /usr/bin/google-chrome and
+            /usr/bin/chromium; pass that to Playwright as `executable_path` (its bundled
+            browsers are not downloaded).
+          - Try the cheapest source first: a direct GitHub release asset, then the vendor's own
+            API or CDN, then an APK mirror.
+          - If a mirror answers 403 with a "Just a moment..." Cloudflare page, ask FlareSolverr
+            (`$FLARESOLVERR_URL`, normally http://127.0.0.1:8191):
+
+                curl -sS -X POST "$FLARESOLVERR_URL/v1" -H 'Content-Type: application/json' \
+                  -d '{"cmd":"request.get","url":"<page>","maxTimeout":120000}'
+
+            Read `solution.status`, `solution.response` and `solution.cookies` from the JSON.
+            For a multi-step flow (app page, then download page, then file) call
+            `{"cmd":"sessions.create"}` once, pass that `session` to every `request.get`, and
+            `sessions.destroy` when done. If the page shows a Turnstile widget, retry with
+            `"tabs_till_verify": 2`.
+          - A `cf_clearance` cookie only works with the User-Agent that solved it. Send
+            `solution.headers["user-agent"]` as the UA on every follow-up request, including
+            curl_cffi's `impersonate` and cloudscraper's browser map, or the mirror answers 403
+            again.
+          - If FlareSolverr is unset or fails, fall back to `curl_cffi` with
+            `impersonate="chrome"`, then `cloudscraper`, then Playwright on system Chrome.
+            Report a blocked mirror instead of guessing at paid or third-party download links.
+          EOF
+
           # CI autonomy override. The brief is already in task.md; no separate AGENTS.md is created.
           # Keep this last so it wins if an earlier instruction mentions asking for confirmation.
           cat >> "${RUNNER_TEMP}/task.md" <<'EOF'
@@ -528,6 +661,7 @@ jobs:
           APK_PATH: ${{ steps.prepare.outputs.apk_path }}
           BASE_APK_PATH: ${{ steps.prepare.outputs.base_apk_path }}
           DECOMPILED_DIR: ${{ runner.temp }}/decompiled
+          AGENT_BRIEF_DIR: ${{ runner.temp }}/brief
         run: |
           set -uo pipefail
 
@@ -537,7 +671,10 @@ jobs:
           LOG="${RUNNER_TEMP}/agent-output.log"
           TASK_SNAPSHOT="${RUNNER_TEMP}/task-private-scan.md"
           : > "$LOG"
-          cp "${RUNNER_TEMP}/task.md" "$TASK_SNAPSHOT" 2>/dev/null || true
+          # The prompt no longer carries the brief, so the sanitizer reads the private bundle
+          # prepare wrote; fall back to the task file if an older prepare did not write one.
+          cp "${RUNNER_TEMP}/private-scan.md" "$TASK_SNAPSHOT" 2>/dev/null \
+            || cp "${RUNNER_TEMP}/task.md" "$TASK_SNAPSHOT" 2>/dev/null || true
 
           # Always stream. A step that prints nothing for an hour looks hung and gets
           # cancelled, which is exactly what happened before: the transcript stayed in
@@ -764,7 +901,8 @@ jobs:
            steps.validate_changes.outcome == 'failure' ||
            steps.build_bundle.outcome == 'failure' ||
            steps.verify_patch.outcome == 'failure')
-        # 2 attempts x 25 min plus the validate/build/verify tail, inside the job cap.
+        # 2 attempts x 20 min plus the validate/build/verify tail, inside the job cap. Each
+        # attempt is also killed early when it stops making progress (see the watchdog below).
         timeout-minutes: 55
         env:
           AI_GATEWAY_API_KEY: ${{ secrets.AI_API_KEY }}
@@ -775,6 +913,7 @@ jobs:
           APK_URL: ${{ steps.prepare.outputs.apk_url }}
           APK_PATH: ${{ steps.prepare.outputs.apk_path }}
           BASE_APK_PATH: ${{ steps.prepare.outputs.base_apk_path }}
+          AGENT_BRIEF_DIR: ${{ runner.temp }}/brief
           INITIAL_AGENT_OUTCOME: ${{ steps.agent.outcome }}
           INITIAL_VALIDATE_OUTCOME: ${{ steps.validate_changes.outcome }}
           INITIAL_BUILD_OUTCOME: ${{ steps.build_bundle.outcome }}
@@ -800,7 +939,25 @@ jobs:
             INITIAL_LOG="${RUNNER_TEMP}/verify.log"
           fi
 
+          # Progress, not just wall clock: the main agent kills a wedged Codex well before its
+          # step timeout, and repair needs the same signal. Defaults match the main agent.
+          STALL_LIMIT="${AGENT_STALL_LIMIT:-900}"
+          FIRST_TOOL_LIMIT="${AGENT_FIRST_TOOL_LIMIT:-900}"
+          WATCH_INTERVAL="${AGENT_WATCH_INTERVAL:-30}"
+          # Two capped attempts plus the validate/build/verify tail stay inside the 55-minute step.
+          ATTEMPT_CAP="${REPAIR_ATTEMPT_CAP:-1200}"
+          # Do not start attempt 2 unless roughly another capped attempt still fits the step.
+          SECOND_ATTEMPT_AFTER="${REPAIR_SECOND_ATTEMPT_AFTER:-2100}"
+          script_start=$(date +%s)
+
           for attempt in 1 2; do
+            if [ "$attempt" -gt 1 ]; then
+              used=$(( $(date +%s) - script_start ))
+              if [ "$used" -ge "$SECOND_ATTEMPT_AFTER" ]; then
+                echo "::error::Repair attempt 1 used ${used}s of the step budget; not starting a second attempt."
+                exit 1
+              fi
+            fi
             echo "Automatic repair attempt ${attempt} after ${INITIAL_STAGE} failed."
             cp "${RUNNER_TEMP}/task.md" "${RUNNER_TEMP}/repair-task.md"
             {
@@ -830,31 +987,86 @@ jobs:
             CODEX_LOG="${RUNNER_TEMP}/repair-${attempt}-codex.log"
             REPAIR_SNAPSHOT="${RUNNER_TEMP}/repair-${attempt}-private-scan.md"
             : > "$CODEX_LOG"
-            cp "${RUNNER_TEMP}/repair-task.md" "$REPAIR_SNAPSHOT" 2>/dev/null || true
+            cp "${RUNNER_TEMP}/private-scan.md" "$REPAIR_SNAPSHOT" 2>/dev/null \
+              || cp "${RUNNER_TEMP}/repair-task.md" "$REPAIR_SNAPSHOT" 2>/dev/null || true
+            # Same watchdog shape as the main agent: sample the log every interval, and kill a
+            # Codex that stops growing or never calls a tool. Without it a wedged attempt sat
+            # on its whole cap (45071051087, 45054806897) or the entire step timeout
+            # (44986227483; 45027445435 attempt 1 ran 57 minutes and printed one line).
             start=$(date +%s)
-            (
-              while sleep 30; do
-                bytes=$(wc -c < "$CODEX_LOG" 2>/dev/null || echo 0)
-                echo "::notice::repair agent still running (attempt ${attempt}): $(( $(date +%s) - start ))s elapsed, $(( bytes / 1024 )) KB of output"
-              done
-            ) &
-            heartbeat=$!
-            # Bound each attempt. Unbounded, one stuck turn ate the whole 60-minute step in
-            # run 44986227483 and attempt 2 never ran. 2 x 25 min still fits the step.
-            timeout 1500 codex exec \
+            REPAIR_STREAM="${RUNNER_TEMP}/repair-${attempt}-stream.log"
+            : > "$REPAIR_STREAM"
+            acted=0
+            stalled=""
+            last=-1
+            stall=0
+            codex exec \
               --sandbox danger-full-access \
               --skip-git-repo-check \
               --model "${AI_MODEL}" \
               --output-last-message "${RUNNER_TEMP}/repair-message-${attempt}.md" \
-              - < "${RUNNER_TEMP}/repair-task.md" 2>&1 \
-              | tee "$CODEX_LOG" \
-              | python3 -u "${GITHUB_WORKSPACE}/.github/scripts/stream_agent_log.py" "$REPAIR_SNAPSHOT"
-            codex_status=${PIPESTATUS[0]}
-            kill "$heartbeat" 2>/dev/null || true
-            if [ "$codex_status" = "124" ]; then
-              echo "::warning::Repair attempt ${attempt} hit the 25-minute cap and was stopped."
+              - < "${RUNNER_TEMP}/repair-task.md" > "$CODEX_LOG" 2>&1 &
+            codex_pid=$!
+
+            tail -n +1 -F "$CODEX_LOG" --pid="$codex_pid" 2>/dev/null \
+              | python3 -u "${GITHUB_WORKSPACE}/.github/scripts/stream_agent_log.py" "$REPAIR_SNAPSHOT" \
+              | tee -a "$REPAIR_STREAM" &
+            stream_pid=$!
+
+            while kill -0 "$codex_pid" 2>/dev/null; do
+              sleep "$WATCH_INTERVAL"
+              elapsed=$(( $(date +%s) - start ))
+              size=$(wc -c < "$CODEX_LOG" 2>/dev/null || echo 0)
+              if [ "$size" -eq "$last" ]; then stall=$((stall + WATCH_INTERVAL)); else stall=0; last=$size; fi
+              if grep -qE '^(exec|apply_patch)$' "$CODEX_LOG" 2>/dev/null; then acted=1; fi
+              echo "::notice::repair attempt ${attempt} running: ${elapsed}s elapsed, $(( size / 1024 )) KB output, ${stall}s stale, tool calls: $([ "$acted" -eq 1 ] && echo yes || echo no)"
+              # The gateway rejects an over-long conversation, and Codex then retries the same
+              # too-large request: no amount of waiting recovers from that (45054806897).
+              if grep -q 'maximum context length' "$CODEX_LOG" 2>/dev/null; then
+                stalled="the model context limit was exceeded"
+                break
+              fi
+              if [ "$stall" -ge "$STALL_LIMIT" ]; then
+                stalled="no new output for ${stall}s"
+                break
+              fi
+              if [ "$acted" -eq 0 ] && [ "$elapsed" -ge "$FIRST_TOOL_LIMIT" ]; then
+                stalled="no tool call in ${FIRST_TOOL_LIMIT}s"
+                break
+              fi
+              if [ "$elapsed" -ge "$ATTEMPT_CAP" ]; then
+                stalled="the ${ATTEMPT_CAP}s attempt cap"
+                break
+              fi
+            done
+
+            if [ -n "$stalled" ]; then
+              echo "::warning::Repair attempt ${attempt} wedged (${stalled}); killing it instead of waiting it out."
+              kill -TERM "$codex_pid" 2>/dev/null || true
+              sleep 5
+              kill -KILL "$codex_pid" 2>/dev/null || true
             fi
-            echo "Repair Codex attempt ${attempt} exited with status ${codex_status}."
+
+            codex_status=0
+            wait "$codex_pid" 2>/dev/null || codex_status=$?
+            [ -n "$stalled" ] && codex_status=124
+            sleep 2
+            kill "$stream_pid" 2>/dev/null || true
+            echo "Repair Codex attempt ${attempt} exited with status ${codex_status} after $(( $(date +%s) - start ))s."
+
+            if [ "$codex_status" = "124" ] || [ -n "$stalled" ]; then
+              # A killed attempt cannot have produced a valid tree, so its validation is wasted
+              # time. If the first attempt never called a tool, a second identical attempt would
+              # wedge the same way (44986227483, 45027445435).
+              if [ "$attempt" -eq 1 ] && [ "$acted" -eq 0 ]; then
+                echo "::error::Repair attempt 1 never called a tool (${stalled:-exit 124}); a second attempt would wedge the same way."
+                exit 1
+              fi
+              echo "::warning::Skipping validation for repair attempt ${attempt}: the agent was stopped before finishing."
+              INITIAL_STAGE="the stopped repair attempt ${attempt}"
+              INITIAL_LOG=""
+              continue
+            fi
 
             VALIDATE_LOG="${RUNNER_TEMP}/repair-${attempt}-validate.log"
             BUILD_LOG="${RUNNER_TEMP}/repair-${attempt}-build.log"
