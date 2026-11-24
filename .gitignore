@@ -138,3 +138,6 @@ local.properties
 
 # Private release signing key. The public key is committed; this file is not.
 morphe-signing.key
+
+# Local CI scratch: run logs, API dumps and simulations. Never commit.
+.ci-logs/
