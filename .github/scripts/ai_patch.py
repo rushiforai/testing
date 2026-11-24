@@ -886,15 +886,26 @@ read that index now, then open a reference file only when your current step need
 
 {request_text}
 
+## Work order
+
+1. Decompile once, as described above.
+2. Create the patch sources before any deep analysis. This repository already
+   contains complete patches under `patches/src/main/kotlin/app/template/patches/`
+   (`aaad`, `protonvpn`, `monet`, `mindicator`, ...). Copy the closest one into a
+   new folder for this app and adapt its package, `name`, `description` and
+   `Compatibility` to the package in the issue. That compiling skeleton is your
+   first deliverable: it gives the build something to work on while you fill in
+   fingerprints and filters.
+3. Only then read the decompiled tree to complete the patch.
+
 ## Budget
 
-This run has one job: a patch that builds and applies. Spend no more than 15
-minutes reading the decompiled tree before you write the first patch file, then
-iterate on the build. Keep every tool's output small (`rg -n -m 20`, `sed -n`,
-`wc -l`, `head -c 4000`); never `cat` a smali or Java file, print a whole dex
-listing, or dump a full log. A run that fills its context with decompiler output
-ends with no patch at all (run 45306413889 spent 35 minutes analysing and wrote
-nothing).
+Create your first file within 10 minutes; the analysis allowance exists to fill
+in a skeleton you already wrote, not to postpone it. Keep every tool's output
+small (`rg -n -m 20`, `sed -n`, `wc -l`, `head -c 4000`); never `cat` a smali or
+Java file, print a whole dex listing, or dump a full log. Two runs that analysed
+for 30+ minutes without writing a file produced nothing (45306413889,
+45314415820).
 
 """
 
