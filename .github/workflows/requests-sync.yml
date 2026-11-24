@@ -4,14 +4,17 @@ name: Sync community requests
 # An issue created here is inert: the AI patch workflow only starts its agent after a
 # maintainer comments `approve` (optionally `approve <url>`) on that issue.
 #
-# GitHub only runs scheduled workflows that exist on the default branch, so the daily run
-# starts after this file reaches `main`. Until then it can be tested with `workflow_dispatch`
-# on `dev` once the file is also present on `main`.
+# GitHub only runs scheduled workflows that exist on the default branch, which is `dev`.
+# A run can also be started with `workflow_dispatch` on `dev`.
 #
 # New requests come from the full board API; the RSS feed supplies update events (patch text,
 # last activity, link). A failed or malformed feed warns and falls back to the API, and a bad
 # API entry is skipped. At most REQUESTS_MAX_NEW issues are created per run (default 100,
 # 0 = no limit). The API keeps every request, so the rest wait for a later run.
+#
+# The board reports `exists` once a patch for that app exists; the sync closes the matching
+# issue with a comment instead of leaving it open for someone to approve. Issues the agent
+# has locked mid-run are left alone until the run finishes.
 
 on:
   schedule:
@@ -26,6 +29,10 @@ on:
         description: "Maximum new issues this run (0 = no limit)"
         type: string
         default: "100"
+      close_exists:
+        description: "Close tracked issues the board already lists as having a patch"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -59,5 +66,8 @@ jobs:
           args=()
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             args+=(--dry-run)
+          fi
+          if [ "${{ inputs.close_exists }}" != "false" ]; then
+            args+=(--close-exists)
           fi
           python3 .github/scripts/requests_sync.py "${args[@]}"

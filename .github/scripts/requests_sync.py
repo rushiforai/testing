@@ -464,7 +464,7 @@ def list_tracked_issues() -> list[dict]:
         "--paginate",
         f"repos/{repo}/issues?labels={LABEL}&state=all&per_page=100",
         "--jq",
-        ".[] | {number,title,body,state}",
+        ".[] | {number,title,body,state,locked}",
     )
     issues = []
     for line in result.stdout.splitlines():
@@ -493,6 +493,23 @@ def create_issue(item: dict) -> None:
     log(f"  created: {result.stdout.strip()}")
 
 
+def close_issue(number: int, item: dict) -> None:
+    gh(
+        "issue",
+        "close",
+        str(number),
+        "--reason",
+        "completed",
+        "--comment",
+        (
+            f"Closing automatically: morphe-patches.software reports that **{item['app']}** "
+            f"(`{item['package']}`) already has a patch, so this request is covered.\n\n"
+            "Reopen the issue if the existing patch does not do what this request asks for."
+        ),
+    )
+    log(f"  closed: #{number}")
+
+
 def update_issue(number: int, title: str, body: str) -> None:
     gh(
         "issue",
@@ -518,6 +535,11 @@ def main() -> None:
         "--no-api",
         action="store_true",
         help="Use only the RSS feed; do not backfill new requests from the board API.",
+    )
+    parser.add_argument(
+        "--close-exists",
+        action="store_true",
+        help="Close tracked issues the board reports as already having a patch (status=exists).",
     )
     parser.add_argument(
         "--max-new",
@@ -578,6 +600,27 @@ def main() -> None:
     def created_ts(item: dict) -> float:
         value = item.get("created")
         return value.timestamp() if value is not None else 0.0
+
+    # The board reports `exists` once a patch for that app/category is available, which makes
+    # a tracked issue moot even if nobody here acted on it. Locked issues are skipped: the
+    # agent locks an issue while it runs, and closing it mid-run would pull it out from under
+    # the workflow. A closed issue simply stops matching on later runs.
+    closed_by_board = 0
+    if args.close_exists:
+        for guid in sorted(merged):
+            item = merged[guid]
+            if (item.get("status") or "").strip().lower() != "exists":
+                continue
+            issue = by_guid.get(guid)
+            if issue is None or issue.get("state") == "CLOSED":
+                continue
+            if issue.get("locked"):
+                log(f"skip locked #{issue['number']} {guid}: a run is using it")
+                continue
+            log(f"close #{issue['number']} {guid}: the board says a patch already exists")
+            if not args.dry_run:
+                close_issue(int(issue["number"]), item)
+            closed_by_board += 1
 
     created = updated = unchanged = skipped = 0
 
@@ -644,7 +687,7 @@ def main() -> None:
 
     log(
         f"Done: {created} created, {updated} updated, {unchanged} unchanged, "
-        f"{skipped} closed requests skipped."
+        f"{closed_by_board} closed as already patched, {skipped} closed requests skipped."
     )
 
 
